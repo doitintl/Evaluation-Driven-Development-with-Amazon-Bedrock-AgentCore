@@ -1,0 +1,22 @@
+
+digraph G {
+
+  graph [fontname="Helvetica", fontsize=11, bgcolor="white",
+         rankdir=TB, nodesep=0.35, ranksep=0.45, pad=0.25];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled",
+         color="#232F3E", fillcolor="#F7F8FA", fontcolor="#232F3E", penwidth=1.2,
+         margin="0.18,0.11"];
+  edge  [fontname="Helvetica", fontsize=9, color="#5A6B7B", fontcolor="#5A6B7B",
+         penwidth=1.1, arrowsize=0.8];
+
+  rankdir=TB;
+  prod [label="Production\nreal users, real queries,\nOnline Eval scoring every session", fillcolor="#EAF1F8"];
+  extract [label="Extract  (this module)\nquery the results log group,\ntake the lowest scores and the errors", fillcolor="#F7F8FA"];
+  transform [label="Transform\nquery + trajectory + judge reasoning\nbecome Case objects", fillcolor="#F7F8FA"];
+  dev [label="Dev\nadd the cases, watch them fail,\nfix the agent, watch them pass", fillcolor="#F7F8FA"];
+
+  prod -> extract [label="  low scores\l  and errors\l"];
+  extract -> transform;
+  transform -> dev;
+  dev -> prod [label="  deploy, now permanently guarded", color="#FF9900", fontcolor="#FF9900", penwidth=1.6];
+}

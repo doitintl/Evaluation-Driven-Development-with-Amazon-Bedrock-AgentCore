@@ -1,0 +1,36 @@
+
+digraph G {
+
+  graph [fontname="Helvetica", fontsize=11, bgcolor="white",
+         rankdir=TB, nodesep=0.35, ranksep=0.45, pad=0.25];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled",
+         color="#232F3E", fillcolor="#F7F8FA", fontcolor="#232F3E", penwidth=1.2,
+         margin="0.18,0.11"];
+  edge  [fontname="Helvetica", fontsize=9, color="#5A6B7B", fontcolor="#5A6B7B",
+         penwidth=1.1, arrowsize=0.8];
+
+  user [label="You\n(CLI prompt)", fillcolor="white"];
+
+  subgraph cluster_proc {
+    label="One process: the Coordinator agent";
+    fontname="Helvetica"; fontsize=10; fontcolor="#5A6B7B";
+    style="rounded,dashed"; color="#5A6B7B";
+    coord [label="Coordinator\nan LLM that chooses which tool to call", fillcolor="#EAF1F8"];
+    sites [label="query_sites\nattraction lookup"];
+    route [label="plan_route\nitinerary planner"];
+    dine  [label="suggest_dining\nrestaurant picks"];
+    coord -> sites; coord -> route; coord -> dine;
+  }
+
+  data [label="Luminara mock data\nattractions, distances, restaurants", fillcolor="white", style="rounded,filled,dashed"];
+  sites -> data [style=dotted, arrowhead=none];
+  route -> data [style=dotted, arrowhead=none];
+  dine  -> data [style=dotted, arrowhead=none];
+
+  cw [label="CloudWatch\naws/spans + the agent's log group", fillcolor="#EAF1F8"];
+  obs [label="GenAI Observability\nthe trajectory you can see", fillcolor="#EAF1F8"];
+
+  user -> coord [label="  prompt"];
+  coord -> cw [label="  one span per step", color="#FF9900", fontcolor="#FF9900", penwidth=1.6];
+  cw -> obs;
+}

@@ -1,0 +1,22 @@
+
+digraph G {
+
+  graph [fontname="Helvetica", fontsize=11, bgcolor="white",
+         rankdir=TB, nodesep=0.35, ranksep=0.45, pad=0.25];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled",
+         color="#232F3E", fillcolor="#F7F8FA", fontcolor="#232F3E", penwidth=1.2,
+         margin="0.18,0.11"];
+  edge  [fontname="Helvetica", fontsize=9, color="#5A6B7B", fontcolor="#5A6B7B",
+         penwidth=1.1, arrowsize=0.8];
+
+  agent [label="Your agent  (from Module 1)\nemits spans and one record per session", fillcolor="#F7F8FA"];
+  cw [label="CloudWatch\naws/spans  +  the agent's log group", fillcolor="#EAF1F8"];
+  cfg [label="Online Evaluation Config\nwatches the log group,\npicks up finished sessions", fillcolor="#EAF1F8"];
+  judge [label="LLM judge\nscores against a rubric", fillcolor="#EAF1F8"];
+  results [label="Evaluation results log group\nscore + explanation per session", fillcolor="#F7F8FA"];
+
+  agent -> cw [label="  OTLP, SigV4 signed"];
+  cw -> cfg [label="  session goes idle\l  (5 min default)\l"];
+  cfg -> judge;
+  judge -> results [label="  ~5 to 10 min", color="#FF9900", fontcolor="#FF9900", penwidth=1.6];
+}

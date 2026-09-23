@@ -1,0 +1,57 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EDD Workshop root stack. Provisions bootstrap-only infrastructure
+  (VPC + Code Editor). The AgentCore Observability + Evaluation wiring is
+  participant-deployed in Modules 1 and 2 via the workshop content.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: edd-workshop
+  ArtifactsBucket:
+    Type: String
+    Description: S3 bucket holding workshop assets (Lambda zips, repo zip, CFN templates).
+  ArtifactsPrefix:
+    Type: String
+    Default: ''
+    Description: Prefix inside ArtifactsBucket. Workshop Studio populates via {{.AssetsBucketPrefix}}.
+  ServiceName:
+    Type: String
+    Default: travel-agent-edd-workshop
+    Description: |
+      Default OTEL service.name suggested in Module 1 wire-up steps. The
+      participant fills this into the eval+obs CFN's TODO when they deploy
+      it. This value is also baked into config.env on the Code Editor EC2.
+
+Resources:
+  Network:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${ArtifactsBucket}/${ArtifactsPrefix}templates/network-stack-default-vpc.yaml
+      Parameters: { ProjectName: !Ref ProjectName }
+
+  CodeEditor:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: Network
+    Properties:
+      TemplateURL: !Sub https://s3.amazonaws.com/${ArtifactsBucket}/${ArtifactsPrefix}templates/code-editor-stack.yaml
+      Parameters:
+        ProjectName: !Ref ProjectName
+        ArtifactsBucket: !Ref ArtifactsBucket
+        ArtifactsPrefix: !Ref ArtifactsPrefix
+        ServiceName: !Ref ServiceName
+        # Re-use the network stack's VPC + first public subnet to avoid
+        # hitting the per-region VPC quota.
+        ExistingVpcId: !GetAtt Network.Outputs.VpcId
+        ExistingSubnetId: !Select [0, !Split [",", !GetAtt Network.Outputs.PublicSubnetIds]]
+
+Outputs:
+  CodeEditorUrl:
+    Description: VS Code in browser (entry point for Modules 0 onward)
+    Value: !GetAtt CodeEditor.Outputs.CodeEditorUrl
+
+  ServiceName:
+    Description: |
+      Default OTEL service.name suggested in Module 1. The participant uses
+      this value when filling the TODO in agentcore-eval-and-obs.yaml.
+    Value: !Ref ServiceName

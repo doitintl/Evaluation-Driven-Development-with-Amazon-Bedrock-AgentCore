@@ -1,0 +1,30 @@
+
+digraph G {
+
+  graph [fontname="Helvetica", fontsize=11, bgcolor="white",
+         rankdir=TB, nodesep=0.35, ranksep=0.45, pad=0.25];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled",
+         color="#232F3E", fillcolor="#F7F8FA", fontcolor="#232F3E", penwidth=1.2,
+         margin="0.18,0.11"];
+  edge  [fontname="Helvetica", fontsize=9, color="#5A6B7B", fontcolor="#5A6B7B",
+         penwidth=1.1, arrowsize=0.8];
+
+  subgraph cluster_ec2 {
+    label="Code Editor EC2  (your agent keeps running where it already runs)";
+    fontname="Helvetica"; fontsize=10; fontcolor="#5A6B7B";
+    style="rounded"; color="#232F3E"; bgcolor="#FBFCFD";
+    agent [label="pi-mono travel agent\nCoordinator + 3 tools", fillcolor="#F7F8FA"];
+    adapter [label="OpenInference adapter  (you write this)\nAGENT / LLM / TOOL spans\nmodel name, token counts", fillcolor="#EAF1F8"];
+    agent -> adapter [label="  lifecycle events"];
+  }
+
+  xray [label="AWS X-Ray OTLP endpoint\nxray.{region}.amazonaws.com", fillcolor="#EAF1F8"];
+  spans [label="aws/spans\nevery span, queryable", fillcolor="#EAF1F8"];
+  dash [label="GenAI Observability\ndashboard", fillcolor="#EAF1F8"];
+  eval [label="AgentCore\nEvaluation", fillcolor="#EAF1F8"];
+
+  adapter -> xray [label="  OTLP, SigV4 signed", color="#FF9900", fontcolor="#FF9900", penwidth=1.6];
+  xray -> spans;
+  spans -> dash;
+  spans -> eval;
+}

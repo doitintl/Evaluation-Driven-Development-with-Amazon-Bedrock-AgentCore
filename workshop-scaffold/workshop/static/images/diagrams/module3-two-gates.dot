@@ -1,0 +1,24 @@
+
+digraph G {
+
+  graph [fontname="Helvetica", fontsize=11, bgcolor="white",
+         rankdir=TB, nodesep=0.35, ranksep=0.45, pad=0.25];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled",
+         color="#232F3E", fillcolor="#F7F8FA", fontcolor="#232F3E", penwidth=1.2,
+         margin="0.18,0.11"];
+  edge  [fontname="Helvetica", fontsize=9, color="#5A6B7B", fontcolor="#5A6B7B",
+         penwidth=1.1, arrowsize=0.8];
+
+  change [label="You change something\nmodel swap, prompt edit, new tool", fillcolor="white"];
+  pre [label="Pre-deploy gate:  npm run eval\n6 curated cases, both lenses\nfast, repeatable, blocks the PR", fillcolor="#F7F8FA"];
+  ship [label="Ship it", fillcolor="#EAF1F8"];
+  post [label="Post-deploy safety net:  Online Evaluation\ncontent + trajectory on every real session\ncontinuous, no one has to remember", fillcolor="#F7F8FA"];
+  loop [label="Module 4:  failures become new cases", fillcolor="#EAF1F8"];
+
+  change -> pre;
+  pre -> ship [label="  both lenses green", color="#FF9900", fontcolor="#FF9900", penwidth=1.6];
+  pre -> change [label="  a lens went red", style=dashed, constraint=false];
+  ship -> post;
+  post -> loop [label="  regression on traffic\l  you never anticipated\l"];
+  loop -> pre [label="  now guarded forever", style=dashed];
+}

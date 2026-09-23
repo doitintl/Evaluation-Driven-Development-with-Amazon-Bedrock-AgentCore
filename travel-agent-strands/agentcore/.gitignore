@@ -1,0 +1,21 @@
+# Account-specific deploy target — generated on-box in workshop step 1a.2.3
+# (carries the AWS account id + region for THIS event's account).
+aws-targets.json
+
+# Secrets (local environment files are never committed)
+.env.local
+
+# CDK app the AgentCore CLI synthesizes at deploy time
+cdk/cdk.out/
+cdk/node_modules/
+
+# Build-staging output from `agentcore package` (rebuilt fresh each deploy)
+travelAgent/
+*.zip
+
+# CLI internals + ephemeral staging
+.cli/*
+.cache/*
+
+# Exception: keep the deployed-state so status/invoke work across sessions
+!.cli/deployed-state.json

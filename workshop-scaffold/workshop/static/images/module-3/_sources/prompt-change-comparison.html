@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<style>
+  :root{
+    --bg:#0d1826; --card:#16283d; --card2:#132135; --line:#24374f;
+    --blue:#4d9fff; --muted:#8ba0b8; --text:#e6edf5;
+    --green:#4ac26b; --amber:#e3b341; --red:#f2704e; --grey:#9fb0c3;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--bg);width:1361px;height:788px;
+    font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--text)}
+  .wrap{padding:34px 40px}
+  .head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px}
+  h1{font-size:26px;color:var(--blue);font-weight:700;letter-spacing:.2px}
+  .sub{font-size:15px;color:var(--muted);margin-top:6px}
+  .pill{background:#123a2a;color:#7ee0a6;border:1px solid #2a6b48;
+    font-size:13px;font-weight:600;padding:7px 14px;border-radius:16px;white-space:nowrap}
+  .card{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:6px 22px 14px}
+  table{width:100%;border-collapse:collapse;font-size:15px}
+  th{color:var(--muted);font-weight:600;text-align:left;padding:16px 8px 10px;font-size:13.5px;
+     border-bottom:1px solid var(--line)}
+  td{padding:12px 8px;border-bottom:1px solid rgba(36,55,79,.55)}
+  tr:last-child td{border-bottom:none}
+  .sub2 th{padding-top:8px;border-bottom:1px solid var(--line)}
+  .case{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:13.5px;color:#cdd9e6}
+  .pass{color:var(--green);font-weight:700}
+  .fail{color:var(--red);font-weight:700}
+  .g{color:var(--green)} .a{color:var(--amber)} .r{color:var(--red)}
+  .badge{font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:5px;letter-spacing:.3px}
+  .badge.good{background:#1f6b3f;color:#c9f7d9}
+  .badge.fixed{background:#1f6b3f;color:#c9f7d9}
+  .eq{color:var(--muted)}
+  .foot{display:flex;align-items:center;gap:60px;background:var(--card);
+    border:1px solid var(--line);border-radius:12px;padding:22px 26px;margin-top:20px}
+  .col h3{font-size:15px;color:var(--muted);font-weight:600;margin-bottom:12px}
+  .col .row{font-size:15px;margin:9px 0}
+  .verdict{margin-left:auto;background:#1f6b3f;border:1px solid #2f905a;color:#d6ffe6;
+    font-size:17px;font-weight:700;padding:14px 22px;border-radius:9px}
+  .note{margin-top:18px;background:#132f4d;border-left:4px solid var(--blue);
+    border-radius:8px;padding:16px 20px;font-size:14.5px;line-height:1.5;color:#d6e4f2}
+  .note b{color:#fff}
+</style></head>
+<body><div class="wrap">
+  <div class="head">
+    <div><h1>Before vs After Prompt Fix</h1>
+      <div class="sub">Adding ABSOLUTE RULE to Coordinator system prompt</div></div>
+    <div class="pill">EDD Loop: change → eval → ship</div>
+  </div>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th style="width:36%">Case</th>
+          <th colspan="2">BEFORE (original prompt)</th><th colspan="2">AFTER (with ABSOLUTE RULE)</th>
+          <th style="width:14%">Delta</th></tr>
+        <tr class="sub2"><th></th><th>Traj</th><th>Content</th><th>Traj</th><th>Content</th><th></th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="case">luminara_2day_history_monday</td>
+          <td class="pass">PASS</td><td class="a">0.40</td><td class="pass">PASS</td><td class="g">1.00</td>
+          <td><span class="badge good">+0.60</span></td></tr>
+        <tr><td class="case">luminara_weekend_attractions</td>
+          <td class="pass">PASS</td><td class="g">1.00</td><td class="pass">PASS</td><td class="g">1.00</td>
+          <td class="eq">=</td></tr>
+        <tr><td class="case">luminara_advance_booking_aware</td>
+          <td class="pass">PASS</td><td class="g">1.00</td><td class="pass">PASS</td><td class="g">1.00</td>
+          <td class="eq">=</td></tr>
+        <tr><td class="case">luminara_dining_focus</td>
+          <td class="fail">FAIL</td><td class="r">0.00</td><td class="pass">PASS</td><td class="g">1.00</td>
+          <td><span class="badge fixed">FIXED</span></td></tr>
+        <tr><td class="case">luminara_3day_balanced</td>
+          <td class="pass">PASS</td><td class="g">0.85</td><td class="pass">PASS</td><td class="a">0.72</td>
+          <td class="r">−0.13</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="foot">
+    <div class="col"><h3>Before</h3>
+      <div class="row">Trajectory: <span class="a">4/5</span></div>
+      <div class="row">Content avg: <span class="a">0.65</span></div></div>
+    <div class="col"><h3>After</h3>
+      <div class="row">Trajectory: <span class="g">5/5</span></div>
+      <div class="row">Content avg: <span class="g">0.93</span></div></div>
+    <div class="verdict">SHIP ✓ Both lenses improved</div>
+  </div>
+  <div class="note"><b>The EDD Loop:</b> One prompt change → trajectory fixed (FAIL→PASS) →
+    content jumped 0.40→1.00 → no regression on other cases → safe to ship.</div>
+</div></body></html>

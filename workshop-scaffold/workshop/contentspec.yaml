@@ -1,0 +1,80 @@
+version: 2.0
+
+defaultLocaleCode: en-US
+localeCodes:
+  - en-US
+  - ja-JP
+
+additionalLinks:
+  - title: Amazon Bedrock AgentCore
+    link: https://aws.amazon.com/bedrock/agentcore/
+  - title: AgentCore Observability, outside Runtime
+    link: https://github.com/awslabs/amazon-bedrock-agentcore-samples/tree/main/01-tutorials/06-AgentCore-observability/02-Agent-not-hosted-on-runtime
+  - title: openevals + agentevals (LangSmith)
+    link: https://github.com/langchain-ai/openevals
+
+awsAccountConfig:
+  accountSources:
+    - workshop_studio
+  serviceLinkedRoles:
+    # Defining SLRs here keeps account recycling clean (no "role already
+    # exists" failures from CFN re-deploys against recycled accounts).
+    # Bedrock has no service-linked role; trust principal alone suffices.
+    - lambda.amazonaws.com
+  participantRole:
+    # WSParticipantRole is exercised when the attendee browses the AWS console
+    # (e.g., CloudFormation Outputs tab in Module 0, GenAI Observability dashboard).
+    # Console-driven aws-cli commands (CFN deploy, log filter, etc.) all run inside
+    # the Code Editor EC2, which uses the *EditorRole* (defined in code-editor-stack.yaml
+    # with a tightly scoped inline policy — see Holmes round 2 fixes). So this role
+    # only needs ReadOnlyAccess for browsing, plus a small write-allowlist for the
+    # cleanup `Delete` click in the summary.
+    managedPolicies:
+      - "arn:aws:iam::aws:policy/ReadOnlyAccess"
+    iamPolicies:
+      - static/iam/participant-write.json
+    trustedPrincipals:
+      service:
+        - ec2.amazonaws.com
+        - lambda.amazonaws.com
+        - codebuild.amazonaws.com
+        - bedrock.amazonaws.com
+        - bedrock-agentcore.amazonaws.com
+        - eks.amazonaws.com
+  regionConfiguration:
+    minAccessibleRegions: 1
+    maxAccessibleRegions: 3
+    accessibleRegions:
+      # No region is hard-required. Bedrock AgentCore (control + data
+      # plane, incl. AgentCore Online Evaluations) is GA in multiple AWS
+      # Regions across the US, Asia Pacific, and Europe — see the
+      # Bedrock AgentCore endpoints + quotas page for the current
+      # authoritative list:
+      # https://docs.aws.amazon.com/general/latest/gr/bedrock_agentcore.html
+      # The workshop's IAM and CFN templates are region-agnostic. The
+      # default judge-model + agent invocation use the `us.*`
+      # cross-region inference profile, which covers the US geography;
+      # Asia-Pacific or Europe regions need a region-matching profile
+      # (apac.*, eu.*) — see Module 1 step 02.
+      optional:
+        - us-east-1
+        - us-east-2
+        - us-west-2
+    deployableRegions:
+      recommended:
+        - us-east-1
+        - us-east-2
+        - us-west-2
+
+infrastructure:
+  cloudformationTemplates:
+    - templateLocation: static/main-stack.yaml
+      label: edd-workshop
+      participantAllStackOutputsVisible: true
+      parameters:
+        - templateParameter: ArtifactsBucket
+          defaultValue: "{{.AssetsBucketName}}"
+        - templateParameter: ArtifactsPrefix
+          defaultValue: "{{.AssetsBucketPrefix}}"
+
+# build-trigger: 2026-09-23 ja-JP translation added, all 37 pages

@@ -1,0 +1,933 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AgentCore Observability + Online Evaluation, participant-deployed.
+  Creates Transaction Search wiring, agent log group + index policy,
+  the LLM-as-Judge evaluator (Builtin.Helpfulness OR custom rubric),
+  eval-execution role, and Online Evaluation Config.
+
+# ============================================================================
+# PARAMETERS — edit these inline before deploying
+# ============================================================================
+Parameters:
+
+  # ----------------------------------------------------------------
+  # TODO #1 — ServiceName
+  # ----------------------------------------------------------------
+  # The OTEL `service.name` your agent emits. AgentCore Online Eval
+  # uses this as the join key — it MUST match exactly the value your
+  # agent publishes via `OTEL_RESOURCE_ATTRIBUTES`. Mismatch = no
+  # sessions are picked up and your dashboard stays empty.
+  #
+  #   variant 1a (Strands on AgentCore Runtime):
+  #     The Runtime auto-generates TWO different strings, and this
+  #     parameter is the LOG GROUP one:
+  #       log group suffix : <agentName>-<runtimeId>-<endpoint>
+  #       emitted svc name : <agentName>.<endpoint>   (see EmittedServiceName)
+  #     e.g. travelAgentStrands_travelAgent-v1myVr6wel-DEFAULT
+  #      vs. travelAgentStrands_travelAgent.DEFAULT
+  #     Run the agent once first, then read both from CW Logs (Path A.2).
+  #   variant 1b (Strands on EC2):              travel-agent-strands-edd-workshop
+  #   variant 1c (pi-mono on EC2):              travel-agent-edd-workshop
+  #   variant 1d (pi-mono on EKS):              travel-agent-edd-workshop
+  #
+  ServiceName:
+    Type: String
+    Default: TODO-REPLACE-ME-WITH-YOUR-SERVICE-NAME
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_\-\.]{0,127}$'
+    Description: >
+      The agent LOG GROUP suffix: /aws/bedrock-agentcore/runtimes/<this>.
+      On Path B this equals the emitted OTEL service.name. On Path A
+      (AgentCore Runtime) it is the log-group suffix, which KEEPS the
+      runtime id (e.g. myAgent-ABC123-DEFAULT) and differs from the
+      emitted service.name. REPLACE THE DEFAULT.
+
+  # ----------------------------------------------------------------
+  # EmittedServiceName (Path A only; leave blank on Path B)
+  # ----------------------------------------------------------------
+  # The Online Evaluation Config filters records on the OTEL
+  # `service.name` resource attribute. AgentCore Runtime emits
+  # `<agentName>.<endpoint>` (dot-joined, runtime id dropped), which is
+  # NOT the log-group suffix above. Verified live 2026-08-02: log group
+  # `travelAgentStrands_travelAgent-mCHMSZBWQM-DEFAULT` carries
+  # service.name `travelAgentStrands_travelAgent.DEFAULT`. Passing the
+  # log-group suffix as the filter matches ZERO records and silently
+  # scores nothing.
+  # Leave blank to default to ServiceName (correct for Path B).
+  EmittedServiceName:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z][a-zA-Z0-9_\-\.]{0,127}$'
+    Description: >
+      OTEL service.name the agent actually emits, used as the Online
+      Evaluation Config serviceNames filter. Leave blank on Path B (it
+      then equals ServiceName). On Path A set it to the dot-joined
+      value, e.g. myAgent.DEFAULT.
+
+  # ----------------------------------------------------------------
+  # TODO #2 — EvaluatorMode  (the BIG decision)
+  # ----------------------------------------------------------------
+  # AgentCore ships several built-in evaluators (run
+  # `aws bedrock-agentcore-control list-evaluators` to see all of them;
+  # this subcommand needs AWS CLI >= 2.32.8, otherwise use the boto3
+  # client `bedrock-agentcore-control`).
+  # The most useful for a quick start is `Builtin.Helpfulness`.
+  #
+  #   - Builtin   : Uses the AgentCore-shipped `Builtin.Helpfulness`
+  #                 evaluator. ZERO rubric authoring. Scores 0.0-1.0.
+  #                 Recommended for the first time you wire this up.
+  #   - Custom    : Creates a custom LLM-as-Judge with YOUR rubric.
+  #                 More control; you decide what "good" means for your
+  #                 domain. Required when Helpfulness alone is too generic
+  #                 (e.g. travel agent must also satisfy date constraints).
+  #
+  # The participant-facing pedagogy: start with Builtin, then come back
+  # and switch to Custom once you understand the loop end-to-end.
+  #
+  EvaluatorMode:
+    Type: String
+    Default: Builtin
+    AllowedValues: [Builtin, Custom]
+    Description: >
+      Builtin = use AgentCore's Builtin.Helpfulness (zero rubric setup).
+      Custom = create a custom LLM-as-Judge with the rubric below.
+
+  # ----------------------------------------------------------------
+  # TODO #3 — JudgeModelId  (only used when EvaluatorMode=Custom)
+  # ----------------------------------------------------------------
+  # The Bedrock inference profile the custom LLM judge will use.
+  # AgentCore Online Eval requires a GLOBALLY-available inference
+  # profile — the `global.` prefix, NOT `us.`.
+  #
+  #   Hint (recommended):  global.anthropic.claude-sonnet-4-6
+  #   Hint (alt judge):    global.amazon.nova-2-lite-v1:0
+  #
+  # Why `global.`? AgentCore CreateEvaluator validates the role can
+  # invoke this model GLOBALLY (so eval works regardless of which
+  # region your agent ran in). The `us.` cross-region profile fails
+  # this check with the misleading error "Role does not have access
+  # for model".
+  #
+  # Ignored when EvaluatorMode=Builtin (Builtin.Helpfulness uses an
+  # AgentCore-managed model under the hood).
+  #
+  JudgeModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-4-6
+    AllowedPattern: '^global\.[a-z0-9\-\.:]+$'
+    Description: >
+      Bedrock inference profile id (global. prefix required). Only used
+      when EvaluatorMode=Custom.
+
+  # ----------------------------------------------------------------
+  # TODO #4 — RubricInstructions  (only used when EvaluatorMode=Custom)
+  # ----------------------------------------------------------------
+  # The instructions the custom LLM judge follows when scoring each
+  # session. AgentCore substitutes these placeholders inline at eval time:
+  #   {assistant_turn}            — the agent's response
+  #   {context}                   — preceding context
+  #   {tool_turn}                 — tool calls in this session
+  #   {actual_tool_trajectory}    — list of tools the agent actually called
+  #   {expected_tool_trajectory}  — present only when you set per-session expectations
+  #   {assertions}                — present only when you set per-session assertions
+  #
+  # IMPORTANT: any literal `{` or `}` in your rubric that is NOT one of
+  # the placeholders above will trip the eval validator. Don't include
+  # raw JSON examples; phrase examples in prose.
+  #
+  # Default value below is the canonical 3-dimension travel-agent rubric.
+  # Feel free to tweak it for your own domain.
+  # Ignored when EvaluatorMode=Builtin.
+  #
+  RubricInstructions:
+    Type: String
+    Default: |
+      You are evaluating an AI travel-booking assistant. The user query appears in {assistant_turn}'s preceding context. The agent's response is the {assistant_turn}.
+
+      Score the response on 3 dimensions, each 1-5:
+        1. FACTUAL ACCURACY — Are dates, prices, and constraints consistent with what the agent's tools returned?
+        2. CONSTRAINT SATISFACTION — Did the agent honour every explicit constraint (budget, dates, preferences)?
+        3. HELPFUL AND ACTIONABLE — Is the response clear, complete, with concrete IDs / costs / a usable itinerary?
+
+      Final score = average of the 3 dimensions, rounded to 1 decimal. Return your numeric score using the rating scale provided.
+    MinLength: 50
+    Description: >
+      Custom LLM-judge instructions. Only used when EvaluatorMode=Custom.
+
+  # ----------------------------------------------------------------
+  # TODO #5 — SamplingPercentage
+  # ----------------------------------------------------------------
+  # What fraction of agent sessions to evaluate. Trade-off:
+  #   100 = every session scored. Best for development and the
+  #         duration of a workshop. Highest cost.
+  #    10 = 1-in-10 sampled. Good for steady-state production where
+  #         you only want a smoke detector signal.
+  #     1 = 1-in-100 sampled. Lowest sampling rate; only catches systemic regressions.
+  #
+  #   Hint: 100  (we want every workshop invocation scored)
+  #
+  SamplingPercentage:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      0 < pct <= 100. Default 100 = score every session (right for
+      development and the duration of a workshop). Lower (10, 1) for
+      steady-state production with sampled monitoring.
+
+  # ----------------------------------------------------------------
+  # The two parameters below are auto-injected from config.env on the
+  # Code Editor EC2 (workshop-scaffold pre-bakes them). You typically
+  # don't need to touch them.
+  # ----------------------------------------------------------------
+  ProjectName:
+    Type: String
+    Default: edd-workshop
+  ArtifactsBucket:
+    Type: String
+    Description: |
+      The workshop assets S3 bucket. Pre-baked into config.env on the
+      Code Editor EC2. Used to load the eval-provisioner Lambda zip.
+  ArtifactsPrefix:
+    Type: String
+    Default: ''
+    Description: Prefix inside ArtifactsBucket. Pre-baked into config.env.
+  ProvisionerCodeKey:
+    Type: String
+    Default: lambdas/eval_provisioner.zip
+    Description: |
+      Key (under ArtifactsPrefix) of the eval-provisioner Lambda zip.
+      Override this only when hot-patching a running event: CloudFormation
+      compares Code.S3Key, not the object's content, so replacing the zip at
+      the same key leaves the deployed function on its old code. The packaging
+      script also publishes a content-hashed copy
+      (lambdas/eval_provisioner-<sha8>.zip) to point this at.
+
+# ============================================================================
+# RESOURCES
+# ============================================================================
+# Note: the EvaluatorMode parameter is consumed by the eval_provisioner
+# Lambda at runtime (passed in as ResourceProperties). No Conditions block
+# is needed at CloudFormation parse time.
+Conditions:
+  # Path B (or anyone who leaves it blank): the emitted service.name is
+  # the same string as the log-group suffix.
+  HasEmittedServiceName: !Not [!Equals [!Ref EmittedServiceName, '']]
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # 1) CloudWatch Transaction Search wiring
+  # ------------------------------------------------------------------
+  # Account-level, idempotent. Flips X-Ray's trace segment destination
+  # from the legacy "XRay" backend to "CloudWatchLogs", so OTLP traces
+  # land in the `aws/spans` log group (where AgentCore Online Eval
+  # actually reads them).
+
+  TxnSearchRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: 'IAM `*` resources are paired with `aws:RequestedRegion` Conditions or scoped via Holmes round-2 fixes; cfn-nag W11 does not honor Conditions but Cloudsplaining (used by Holmes) does, and the workshop passes Holmes round 3+ with 0 findings.'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: txnsearch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CW Logs resource-policy: scoped via Condition since the
+              # `logs:PutResourcePolicy` API doesn't accept a resource ARN.
+              # `logs:PutResourcePolicy` / `DescribeResourcePolicies` /
+              # `DeleteResourcePolicy` are ACCOUNT-LEVEL policy-document
+              # APIs that do NOT support resource-level IAM scoping
+              # (verified against the IAM service-authorization
+              # reference for the `logs` service: PutResourcePolicy
+              # has no per-resource ARN, only the policy-document
+              # itself contains a Resource — and that's a separate
+              # scoping layer outside IAM identity policies). The
+              # Lambda body narrowly creates a single named policy
+              # `AgentCoreTxnSearchSpansAccess` that scopes the
+              # underlying CloudWatch Logs resource policy's
+              # Resource: "*" only to the `xray.amazonaws.com`
+              # Principal — a defense-in-depth measure on top of the
+              # IAM identity-policy region Condition below.
+              - Sid: AccountLevelLogsResourcePolicyNoResourceArnAvailable
+                Effect: Allow
+                Action:
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DeleteResourcePolicy
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              # Account-level X-Ray / Application Signals / CloudTrail
+              # service controls. Read-only Describe/Get actions are
+              # split out from the mutating Update/Create actions so the
+              # cfn-nag / Cloudsplaining / Holmes static-analysis tooling
+              # can score each one separately. All four mutating actions
+              # operate at account-singular configuration objects (one
+              # destination, one indexing rule, one app-signals discovery
+              # toggle, one CloudTrail channel) — they do NOT support
+              # resource-level IAM scoping per the IAM
+              # service-authorization references for x-ray,
+              # application-signals, and cloudtrail. Region Condition is
+              # the AWS-recommended pattern here.
+              # This role's TxnSearchFn Lambda calls exactly two X-Ray
+              # account-level APIs: get/update the trace segment destination
+              # (flip "XRay" -> "CloudWatchLogs") and update the single default
+              # indexing rule. Both are account-singular (one destination + one
+              # rule per region per account) with NO resource-level ARN in the
+              # IAM service-authorization reference, so Resource: '*' scoped by
+              # aws:RequestedRegion is the tightest grant possible.
+              #
+              # It does NOT call application-signals:StartDiscovery or
+              # cloudtrail:CreateServiceLinkedChannel — enabling Transaction
+              # Search makes AWS create those service-linked resources on the
+              # caller's behalf via the SLR grant below, which needs no
+              # explicit action permission. Those grants were therefore removed.
+              - Sid: AccountLevelTxnSearchReadNoResourceArn
+                Effect: Allow
+                Action:
+                  - xray:GetTraceSegmentDestination
+                  - xray:GetIndexingRules
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              - Sid: XRayUpdateTraceSegmentDestinationAccountLevelNoResourceArn
+                Effect: Allow
+                Action: xray:UpdateTraceSegmentDestination
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              - Sid: XRayUpdateIndexingRuleAccountLevelNoResourceArn
+                Effect: Allow
+                Action: xray:UpdateIndexingRule
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              # Service-Linked Roles — explicitly enumerated. The
+              # TxnSearchFn Lambda's UpdateTraceSegmentDestination call
+              # delegates SLR creation to AppSignals + CloudTrail; the
+              # AgentCore Online Eval indexing path creates the AOSS
+              # SLR. Each SLR ARN is service-managed by AWS.
+              - Sid: ServiceLinkedRoleCreationForWorkshopServices
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/application-signals.amazonaws.com/*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/cloudtrail.amazonaws.com/*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/observability.aoss.amazonaws.com/*
+
+  TxnSearchFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W89
+          reason: 'One-shot CloudFormation custom-resource Lambda that calls AWS APIs and exits; VPC attachment adds cold-start cost without security benefit.'
+        - id: W92
+          reason: 'Custom-resource Lambda runs at most once per stack create/update; reserved concurrency is unnecessary for one-shot functions.'
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt TxnSearchRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, boto3
+          from botocore.exceptions import ClientError
+
+          POLICY_NAME = 'AgentCoreTxnSearchSpansAccess'
+
+          def send(event, context, status, data=None, reason='OK'):
+              body = json.dumps({
+                  'Status': status, 'Reason': reason,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              urllib.request.urlopen(urllib.request.Request(
+                  event['ResponseURL'], data=body.encode(),
+                  headers={'Content-Type': ''}, method='PUT'))
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send(event, context, 'SUCCESS'); return
+              try:
+                  logs = boto3.client('logs')
+                  # Resource: "*" is required here (verified empirically
+                  # on a fresh account). Narrow ARNs produce a misleading
+                  # "XRay does not have permission to call PutLogEvents on
+                  # the aws/spans Log Group" error from
+                  # UpdateTraceSegmentDestination.
+                  doc = {
+                      'Version': '2012-10-17',
+                      'Statement': [{
+                          'Sid': 'TxnSearchSpans',
+                          'Effect': 'Allow',
+                          'Principal': {'Service': 'xray.amazonaws.com'},
+                          'Action': ['logs:PutLogEvents', 'logs:CreateLogStream'],
+                          'Resource': '*'
+                      }]
+                  }
+                  logs.put_resource_policy(policyName=POLICY_NAME, policyDocument=json.dumps(doc))
+
+                  xray = boto3.client('xray')
+                  current = xray.get_trace_segment_destination().get('Destination', '')
+                  if current == 'CloudWatchLogs':
+                      print('destination already CloudWatchLogs; skipping flip')
+                  else:
+                      flipped = False
+                      last_err = None
+                      for attempt in range(6):
+                          try:
+                              xray.update_trace_segment_destination(Destination='CloudWatchLogs')
+                              flipped = True
+                              break
+                          except ClientError as e:
+                              if 'already set to CloudWatchLogs' in str(e):
+                                  flipped = True
+                                  break
+                              last_err = e
+                              print(f'attempt {attempt + 1}: {e}')
+                              time.sleep(30)
+                      if not flipped:
+                          raise RuntimeError(f'UpdateTraceSegmentDestination failed after retries: {last_err}')
+
+                  try:
+                      xray.update_indexing_rule(
+                          Name='Default',
+                          Rule={'Probabilistic': {'DesiredSamplingPercentage': 100}}
+                      )
+                  except ClientError as e:
+                      print(f'xray idx warn: {e}')
+
+                  send(event, context, 'SUCCESS', {'Enabled': 'true'})
+              except Exception as e:
+                  print(f'FAILED: {e}')
+                  send(event, context, 'FAILED', reason=str(e))
+
+  TxnSearchEnable:
+    Type: Custom::TransactionSearch
+    Properties:
+      ServiceToken: !GetAtt TxnSearchFn.Arn
+      Version: '1'
+
+  # ------------------------------------------------------------------
+  # 2) Agent CloudWatch log group + index policy
+  # ------------------------------------------------------------------
+  # The log group `/aws/bedrock-agentcore/runtimes/<service.name>` is
+  # where the agent's OTEL log records land. Online Eval reads sessions
+  # out of this log group filtered by `service.name` + `session.id` —
+  # those fields need an INDEX POLICY on the log group, otherwise the
+  # eval config's `serviceNames` filter cannot resolve to per-session
+  # events.
+
+  # NOTE: no declarative AWS::Logs::LogGroup here. Module 1's
+  # `edd-observability` stack (or the AgentCore Runtime itself, on Path A)
+  # creates `/aws/bedrock-agentcore/runtimes/<ServiceName>` first, and CFN's
+  # EarlyValidation ResourceExistenceCheck fails a declarative LogGroup whose
+  # name already exists (verified live 2026-07-28: deploying this template
+  # after edd-observability failed the changeset with
+  # AWS::EarlyValidation::ResourceExistenceCheck). The custom resource below
+  # idempotently create-or-adopts the log group + sets retention instead.
+  AgentLogGroupEnsure:
+    Type: Custom::EnsureLogGroup
+    Properties:
+      ServiceToken: !GetAtt IndexPolicyFn.Arn
+      Mode: ensure-log-group
+      LogGroupName: !Sub /aws/bedrock-agentcore/runtimes/${ServiceName}
+      RetentionInDays: 7
+
+  IndexPolicyRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: 'IAM `*` resources are paired with `aws:RequestedRegion` Conditions or scoped via Holmes round-2 fixes; cfn-nag W11 does not honor Conditions but Cloudsplaining (used by Holmes) does, and the workshop passes Holmes round 3+ with 0 findings.'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: index-policy-mgmt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CW Logs index-policy actions require Resource: "*".
+              # Verified empirically — narrow log-group ARNs produce
+              # AccessDenied even for the matching log group; the IAM
+              # service-authorization reference for the `logs` service
+              # confirms `PutIndexPolicy` / `DeleteIndexPolicy` /
+              # `DescribeIndexPolicies` operate at the account level
+              # (the policy is queried by log-group identifier inside
+              # the API call, not via IAM resource-level ARN).
+              # Region Condition is the most restrictive scoping
+              # available; we add it here even though cfn-nag's W11
+              # is suppressed via Metadata to surface a Sid name
+              # reflecting the constraint.
+              - Sid: AccountLevelLogsIndexPolicyNoResourceArnAvailable
+                Effect: Allow
+                Action:
+                  - logs:PutIndexPolicy
+                  - logs:DeleteIndexPolicy
+                  - logs:DescribeIndexPolicies
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              # ensure-log-group mode: create-or-adopt the runtimes log
+              # group (scoped — these actions DO take log-group ARNs).
+              - Sid: EnsureRuntimesLogGroup
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:PutRetentionPolicy
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${ServiceName}
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${ServiceName}:*
+
+  IndexPolicyFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W89
+          reason: 'One-shot CloudFormation custom-resource Lambda that calls AWS APIs and exits; VPC attachment adds cold-start cost without security benefit.'
+        - id: W92
+          reason: 'Custom-resource Lambda runs at most once per stack create/update; reserved concurrency is unnecessary for one-shot functions.'
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt IndexPolicyRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3
+          def send(event, context, status, reason='OK', data=None):
+              body = json.dumps({
+                  'Status': status, 'Reason': reason,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              urllib.request.urlopen(urllib.request.Request(
+                  event['ResponseURL'], data=body.encode(),
+                  headers={'Content-Type': ''}, method='PUT'))
+
+          def handler(event, context):
+              try:
+                  logs = boto3.client('logs')
+                  props = event['ResourceProperties']
+                  # Mode ensure-log-group: idempotent create-or-adopt of a log
+                  # group that another stack (edd-observability) or the
+                  # AgentCore Runtime may have created first. A declarative
+                  # AWS::Logs::LogGroup fails EarlyValidation when the name
+                  # already exists; this does not.
+                  if props.get('Mode') == 'ensure-log-group':
+                      name = props['LogGroupName']
+                      if event['RequestType'] == 'Delete':
+                          # Adopted resource: leave the log group in place —
+                          # Module 1's stack (or Runtime) owns its lifecycle.
+                          send(event, context, 'SUCCESS'); return
+                      try:
+                          logs.create_log_group(logGroupName=name)
+                      except logs.exceptions.ResourceAlreadyExistsException:
+                          pass
+                      try:
+                          logs.put_retention_policy(logGroupName=name,
+                              retentionInDays=int(props.get('RetentionInDays', 7)))
+                      except Exception: pass
+                      send(event, context, 'SUCCESS', data={'LogGroupName': name})
+                      return
+                  arn = props['LogGroupArn']
+                  # !GetAtt LogGroup.Arn returns the ARN with a trailing ':*'
+                  # (the log-stream wildcard suffix). PutIndexPolicy rejects
+                  # that suffix; the API wants the bare log-group ARN.
+                  if arn.endswith(':*'):
+                      arn = arn[:-2]
+                  if event['RequestType'] == 'Delete':
+                      try: logs.delete_index_policy(logGroupIdentifier=arn)
+                      except Exception: pass
+                      send(event, context, 'SUCCESS'); return
+                  fields = props['Fields']
+                  logs.put_index_policy(
+                      logGroupIdentifier=arn,
+                      policyDocument=json.dumps({'Fields': fields}))
+                  send(event, context, 'SUCCESS')
+              except Exception as e:
+                  print(f'FAILED: {e}')
+                  send(event, context, 'FAILED', reason=str(e))
+
+  AgentLogGroupIndexPolicy:
+    Type: Custom::LogGroupIndexPolicy
+    DependsOn: AgentLogGroupEnsure
+    Properties:
+      ServiceToken: !GetAtt IndexPolicyFn.Arn
+      LogGroupArn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${ServiceName}
+      Fields:
+        - resource.attributes.service.name
+        - attributes.session.id
+
+  # ------------------------------------------------------------------
+  # 3) Eval-execution IAM role
+  # ------------------------------------------------------------------
+  # This is the role AgentCore Online Eval ASSUMES to read your agent's
+  # CloudWatch logs and invoke the judge model. Trust policy is scoped
+  # to bedrock-agentcore.amazonaws.com via the standard SourceAccount +
+  # SourceArn ArnLike pattern from the AWS starter-toolkit.
+
+  EvalExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: 'IAM `*` resources are paired with `aws:RequestedRegion` Conditions or scoped via Holmes round-2 fixes; cfn-nag W11 does not honor Conditions but Cloudsplaining (used by Holmes) does, and the workshop passes Holmes round 3+ with 0 findings.'
+        - id: W28
+          reason: 'Explicit name is intentional — workshop instructions reference fixed resource names for the participant experience and rollback safety.'
+    Properties:
+      RoleName: !Sub ${ProjectName}-eval-exec
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: bedrock-agentcore.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:ResourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn:
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:evaluator/*
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:online-evaluation-config/*
+      Policies:
+        - PolicyName: eval-exec
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read perms for AgentCore Eval to query agent logs. The
+              # AWS starter-toolkit IAM uses Resource:* because the
+              # CreateOnlineEvaluationConfig pre-flight inspects log-
+              # group access patterns broadly. Constrained via Condition
+              # to the workshop's deployment region.
+              - Sid: CloudWatchLogReadStatement
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  - logs:GetQueryResults
+                  - logs:StartQuery
+                  - cloudwatch:GenerateQuery
+                  - cloudwatch:GenerateQueryResultsSummary
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              - Sid: CloudWatchIndexPolicyStatement
+                Effect: Allow
+                Action: [logs:DescribeIndexPolicies, logs:PutIndexPolicy]
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*
+              - Sid: WriteEvalResults
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/evaluations/*
+              # Bedrock judge-model invocation. AgentCore CreateEvaluator
+              # pre-flight inspects InvokeModel + Converse access. Scoped
+              # to foundation-model and inference-profile ARNs (the only
+              # things the judge call ever targets); read-only actions
+              # like List/Get on Resource:* with region constraint.
+              - Sid: InvokeJudgeModel
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Sid: BedrockReadOnlyForPreflight
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              # Invoke custom code-based evaluators (AWS Lambda). Module 3.4
+              # registers a `TrajectoryCompliance` evaluator backed by a
+              # Lambda; AgentCore Online Eval assumes THIS role to call it,
+              # so it needs lambda:InvokeFunction + GetFunction. Scoped to the
+              # workshop's evaluator Lambda naming convention.
+              - Sid: InvokeCodeBasedEvaluatorLambda
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunction
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:edd-trajectory-evaluator*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*
+
+  # ------------------------------------------------------------------
+  # 4) Custom evaluator + Online Evaluation Config (custom resource)
+  # ------------------------------------------------------------------
+  # CFN doesn't expose a native AgentCore evaluator/online-eval-config
+  # resource type, so a custom-resource Lambda calls the
+  # `bedrock-agentcore-control` boto3 client. The Lambda zip is loaded
+  # from the workshop assets bucket because the Lambda runtime's stock
+  # boto3 (~1.34) lacks these APIs.
+
+  EvalProvisionerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: 'IAM `*` resources are paired with `aws:RequestedRegion` Conditions or scoped via Holmes round-2 fixes; cfn-nag W11 does not honor Conditions but Cloudsplaining (used by Holmes) does, and the workshop passes Holmes round 3+ with 0 findings.'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: provisioner
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # AgentCore IAM uses `bedrock-agentcore:*` (data-plane
+              # action prefix), even when called via the
+              # `bedrock-agentcore-control` boto3 client.
+              # Scoped to evaluator + online-eval-config ARNs.
+              - Sid: AgentCoreEvalManagement
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvaluator
+                  - bedrock-agentcore:DeleteEvaluator
+                  - bedrock-agentcore:UpdateEvaluator
+                  - bedrock-agentcore:GetEvaluator
+                  - bedrock-agentcore:ListEvaluators
+                  - bedrock-agentcore:CreateOnlineEvaluationConfig
+                  - bedrock-agentcore:DeleteOnlineEvaluationConfig
+                  - bedrock-agentcore:UpdateOnlineEvaluationConfig
+                  - bedrock-agentcore:GetOnlineEvaluationConfig
+                  - bedrock-agentcore:ListOnlineEvaluationConfigs
+                Resource:
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:evaluator/*
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:online-evaluation-config/*
+
+              # PassRole only to the eval-execution role we manage
+              - Sid: PassEvalExecutionRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EvalExecutionRole.Arn
+
+              # Bedrock InvokeModel — scoped to foundation models +
+              # inference profiles. Used for Marketplace warm-up and
+              # CreateEvaluator pre-flight. Wildcard region for
+              # cross-region inference profiles (us.*, global.*).
+              - Sid: BedrockInvokeForWarmup
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+
+              # AWS Marketplace auto-subscribe for the Bedrock judge
+              # model. Scoped via `aws-marketplace:ProductId` to the two
+              # Anthropic Claude product IDs the workshop uses:
+              #   - prod-ffvjxvh4ltq64  (Anthropic Claude Sonnet 4.6)
+              #   - prod-xdkflymybwmvi  (Anthropic Claude Haiku 4.5)
+              # Reference: https://docs.aws.amazon.com/bedrock/latest/userguide/model-access-product-ids.html
+              # Amazon Nova / Meta / Mistral models are not Marketplace
+              # products and don't have product IDs (per the same doc),
+              # so they don't appear here. ViewSubscriptions is a
+              # read-only action that AWS does not gate by ProductId.
+              - Sid: BedrockMarketplaceSubscribeAnthropicProducts
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+                # `aws-marketplace:ProductId` is single-valued (a Subscribe
+                # call carries exactly one ProductId), so plain
+                # `StringEquals` with a list-of-values is correct: the
+                # call matches if its single ProductId equals any one
+                # value in the list. Per AWS docs:
+                # https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_policies_condition-single-vs-multi-valued-context-keys.html
+                # "Do not use condition set operators ForAllValues or
+                # ForAnyValue with single-valued context keys."
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+                    aws-marketplace:ProductId:
+                      - prod-ffvjxvh4ltq64
+                      - prod-xdkflymybwmvi
+              - Sid: BedrockMarketplaceViewSubscriptions
+                Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+
+              # CreateOnlineEvaluationConfig touches the aws/spans log
+              # group's index policy as the CALLER (not via the assumed
+              # role). The error "Access denied when accessing index
+              # policy for aws/spans" surfaces when the Lambda's own
+              # role lacks these.
+              - Sid: SpansIndexPolicy
+                Effect: Allow
+                Action:
+                  - logs:DescribeIndexPolicies
+                  - logs:PutIndexPolicy
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*
+
+              # Eval-result log group creation
+              - Sid: EvalResultLogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/evaluations/*
+
+  EvalProvisionerFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W89
+          reason: 'One-shot CloudFormation custom-resource Lambda that calls AWS APIs and exits; VPC attachment adds cold-start cost without security benefit.'
+        - id: W92
+          reason: 'Custom-resource Lambda runs at most once per stack create/update; reserved concurrency is unnecessary for one-shot functions.'
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EvalProvisionerRole.Arn
+      Timeout: 600
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Sub ${ArtifactsPrefix}${ProvisionerCodeKey}
+
+  EvalSetup:
+    Type: Custom::EvalSetup
+    # AgentLogGroupEnsure is listed explicitly (not just transitively via
+    # AgentLogGroupIndexPolicy) so the log group the Online Eval Config
+    # references is guaranteed to exist before EvalSetup runs, on every
+    # CloudFormation execution path.
+    DependsOn: [TxnSearchEnable, AgentLogGroupEnsure, AgentLogGroupIndexPolicy]
+    Properties:
+      ServiceToken: !GetAtt EvalProvisionerFn.Arn
+      # When EvaluatorMode=Builtin, the Lambda skips CreateEvaluator and
+      # references the AgentCore-shipped Builtin.Helpfulness evaluator
+      # directly in the Online Eval Config. When EvaluatorMode=Custom, it
+      # creates a custom LLM-as-Judge with the rubric below.
+      EvaluatorMode: !Ref EvaluatorMode
+      # Evaluator name regex: ^[a-zA-Z0-9_]+$ (no hyphens). The
+      # eval_provisioner Lambda strips hyphens from EvaluatorName and
+      # ConfigPrefix as a defence-in-depth, but we replace them inline
+      # here too so the CFN parameter passed in is already valid.
+      EvaluatorName: edd_workshop_travel_quality
+      JudgeModelId: !Ref JudgeModelId
+      RubricInstructions: !Ref RubricInstructions
+      ExecutionRoleArn: !GetAtt EvalExecutionRole.Arn
+      # Filter value: what the agent actually emits as service.name.
+      ServiceNames:
+        - !If [HasEmittedServiceName, !Ref EmittedServiceName, !Ref ServiceName]
+      # Log-group value: always the log-group suffix, which on Path A
+      # differs from the emitted service.name above.
+      LogGroupServiceName: !Ref ServiceName
+      ConfigPrefix: edd_workshop
+      SamplingPercentage: !Ref SamplingPercentage
+      # Bump to force the custom resource to re-invoke when the Lambda
+      # code changes but no other parameters do.
+      Version: !Sub "v6|${EvaluatorMode}|${ServiceName}|${EmittedServiceName}|${JudgeModelId}|${SamplingPercentage}"
+
+# ============================================================================
+# OUTPUTS
+# ============================================================================
+Outputs:
+  AgentLogGroupName:
+    Description: |
+      The CloudWatch log group your agent's OTEL exporter must target.
+      Bake this into your agent's `OTEL_EXPORTER_OTLP_LOGS_HEADERS`.
+    Value: !Sub /aws/bedrock-agentcore/runtimes/${ServiceName}
+
+  EvaluatorId:
+    Description: AgentCore custom LLM-as-Judge evaluator id.
+    Value: !GetAtt EvalSetup.EvaluatorId
+
+  EvalExecutionRoleArn:
+    Description: |
+      IAM role assumed by AgentCore Online Eval. You do NOT need to
+      use this directly — the Online Eval Config wires it up.
+    Value: !GetAtt EvalExecutionRole.Arn
+
+  ServiceName:
+    Description: The OTEL service.name this stack is wired to score.
+    Value: !Ref ServiceName
+
+  OnlineEvalConfigs:
+    Description: JSON list of online-eval-config IDs created by this stack.
+    Value: !GetAtt EvalSetup.Configs

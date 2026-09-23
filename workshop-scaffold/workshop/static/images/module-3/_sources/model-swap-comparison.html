@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<style>
+  :root{
+    --bg:#0d1826; --card:#16283d; --card2:#132135; --line:#24374f;
+    --blue:#4d9fff; --muted:#8ba0b8; --text:#e6edf5;
+    --green:#4ac26b; --amber:#e3b341; --red:#f2704e; --grey:#9fb0c3;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{background:var(--bg);width:1361px;height:788px;
+    font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--text)}
+  .wrap{padding:34px 40px}
+  .head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px}
+  h1{font-size:26px;color:var(--blue);font-weight:700;letter-spacing:.2px}
+  .sub{font-size:15px;color:var(--muted);margin-top:6px}
+  .pill{background:#1d3a63;color:#8fc0ff;border:1px solid #2f5b96;
+    font-size:13px;font-weight:600;padding:7px 14px;border-radius:16px;white-space:nowrap}
+  .card{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:6px 22px 14px}
+  table{width:100%;border-collapse:collapse;font-size:15px}
+  th{color:var(--muted);font-weight:600;text-align:left;padding:16px 8px 10px;font-size:13.5px;
+     border-bottom:1px solid var(--line)}
+  td{padding:11px 8px;border-bottom:1px solid rgba(36,55,79,.55)}
+  tr:last-child td{border-bottom:none}
+  .sub2 th{padding-top:8px;border-bottom:1px solid var(--line)}
+  .case{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:13.5px;color:#cdd9e6}
+  .mode{color:var(--grey)}
+  .pass{color:var(--green);font-weight:700}
+  .g{color:var(--green)} .a{color:var(--amber)} .r{color:var(--red)}
+  .badge{font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:5px;letter-spacing:.3px}
+  .badge.warn{background:#e3b341;color:#3a2c05}
+  .eq{color:var(--muted)}
+  .foot{display:flex;align-items:center;gap:60px;background:var(--card);
+    border:1px solid var(--line);border-radius:12px;padding:22px 26px;margin-top:20px}
+  .col h3{font-size:15px;color:var(--muted);font-weight:600;margin-bottom:12px}
+  .col .row{font-size:15px;margin:9px 0}
+  .verdict{margin-left:auto;background:#7a2318;border:1px solid #b5432c;color:#ffd9cd;
+    font-size:17px;font-weight:700;padding:14px 22px;border-radius:9px}
+</style></head>
+<body><div class="wrap">
+  <div class="head">
+    <div><h1>Model Comparison: Sonnet 4.6 vs Nova Pro</h1>
+      <div class="sub">Trajectory + Content scores per case</div></div>
+    <div class="pill">npm run eval</div>
+  </div>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th style="width:34%">Case</th><th style="width:11%">Mode</th>
+          <th colspan="2">Sonnet 4.6 (baseline)</th><th colspan="2">Nova Pro (candidate)</th>
+          <th style="width:16%">Verdict</th></tr>
+        <tr class="sub2"><th></th><th></th><th>Traj</th><th>Content</th><th>Traj</th><th>Content</th><th></th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="case">luminara_2day_history_monday</td><td class="mode">superset</td>
+          <td class="pass">PASS</td><td class="g">1.00</td><td class="pass">PASS</td><td class="r">0.55</td>
+          <td><span class="badge warn">CONTENT REGRESSED</span></td></tr>
+        <tr><td class="case">luminara_weekend_attractions</td><td class="mode">superset</td>
+          <td class="pass">PASS</td><td class="g">1.00</td><td class="pass">PASS</td><td class="a">0.70</td>
+          <td class="r">−0.30</td></tr>
+        <tr><td class="case">luminara_advance_booking_aware</td><td class="mode">superset</td>
+          <td class="pass">PASS</td><td class="g">1.00</td><td class="pass">PASS</td><td class="g">0.97</td>
+          <td class="eq">−0.03</td></tr>
+        <tr><td class="case">luminara_dining_focus</td><td class="mode">superset</td>
+          <td class="pass">PASS</td><td class="g">1.00</td><td class="pass">PASS</td><td class="g">1.00</td>
+          <td class="eq">=</td></tr>
+        <tr><td class="case">luminara_3day_balanced</td><td class="mode">in_order</td>
+          <td class="pass">PASS</td><td class="a">0.42</td><td class="pass">PASS</td><td class="r">0.29</td>
+          <td class="r">−0.13</td></tr>
+        <tr><td class="case">luminara_dining_only_scoped</td><td class="mode">subset</td>
+          <td class="pass">PASS</td><td class="a">0.85</td><td class="pass">PASS</td><td class="g">1.00</td>
+          <td class="g">+0.15</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="foot">
+    <div class="col"><h3>Sonnet 4.6</h3>
+      <div class="row">Trajectory: <span class="g">6/6</span></div>
+      <div class="row">Content avg: <span class="g">0.88</span></div></div>
+    <div class="col"><h3>Nova Pro</h3>
+      <div class="row">Trajectory: <span class="g">6/6</span></div>
+      <div class="row">Content avg: <span class="a">0.75</span></div></div>
+    <div class="verdict">DO NOT SHIP — content regression on 4/6 cases</div>
+  </div>
+</div></body></html>

@@ -1,0 +1,1430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  VS Code (AWS Code Editor) on EC2 for workshop participants. Pre-installed:
+  Python 3.12, Node 22, Docker, AWS CLI v2, kubectl, helm. Repo zip is
+  downloaded from the workshop assets bucket and unpacked into /workshop.
+  CloudFront fronts the EC2 with a token-embedded URL.
+
+Parameters:
+  ProjectName: { Type: String, Default: edd-workshop }
+  ArtifactsBucket: { Type: String }
+  ArtifactsPrefix: { Type: String }
+  InstanceType:
+    Type: String
+    Default: t3.large
+    AllowedValues: [t3.large, t3.xlarge, c6i.large, c6i.xlarge, c6i.2xlarge]
+  CodeEditorUser:
+    Type: String
+    Default: participant
+  HomeFolder:
+    Type: String
+    Default: /workshop
+  RepoName:
+    Type: String
+    Default: edd-workshop
+
+  # CFN outputs to bake into config.env
+  ServiceName:
+    Type: String
+    Default: travel-agent-edd-workshop
+    Description: |
+      Default OTEL service.name used by Path B (any framework — this
+      workshop's pi-mono OpenInference adapter). Path A (Strands on
+      AgentCore Runtime) uses an auto-generated `agent_<id>.DEFAULT` name
+      discovered after deploy.
+
+  # Optional: re-use an existing VPC + subnet (avoids hitting the per-region
+  # VPC quota). When both are blank the stack creates its own VPC.
+  ExistingVpcId:
+    Type: String
+    Default: ''
+  ExistingSubnetId:
+    Type: String
+    Default: ''
+
+Conditions:
+  CreateOwnVpc: !Equals [!Ref ExistingVpcId, '']
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W60
+          reason: 'VPC flow logs add per-GB ingest cost; workshop sandbox is short-lived (event-scoped) and traffic is non-sensitive.'
+    Condition: CreateOwnVpc
+    Properties:
+      CidrBlock: 10.91.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-codeeditor-vpc" }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Condition: CreateOwnVpc
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: CreateOwnVpc
+    Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw }
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W33
+          reason: 'Public subnet is required so the Code Editor EC2 (or NLB front of the orchestrator) has a public IP. Ingress is locked to the CloudFront origin-facing prefix list.'
+    Condition: CreateOwnVpc
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.91.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  Rt:
+    Type: AWS::EC2::RouteTable
+    Condition: CreateOwnVpc
+    Properties: { VpcId: !Ref Vpc }
+
+  Route0:
+    Type: AWS::EC2::Route
+    Condition: CreateOwnVpc
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref Rt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: CreateOwnVpc
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref Rt }
+
+  # Customer-managed KMS CMK used to encrypt the Code Editor password secret
+  # (satisfies CKV_AWS_149 / cfn-nag W77 — encrypt Secrets Manager with a CMK).
+  # Key rotation is enabled and the key policy is scoped to this account's root
+  # plus the Secrets Manager service in-region (no cross-account, no wildcard
+  # principal).
+  EditorSecretKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'CMK for the ${AWS::StackName} Code Editor password secret'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSecretsManagerUseInRegion
+            Effect: Allow
+            Principal: { Service: secretsmanager.amazonaws.com }
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub 'secretsmanager.${AWS::Region}.amazonaws.com'
+
+  # S3 bucket that receives CloudFront standard access logs (CKV_AWS_86).
+  # Fully locked down so it doesn't itself become a finding: SSE-S3
+  # encryption, versioning, all public access blocked, ownership controls
+  # (CloudFront legacy logging writes via ACL, so ObjectWriter is required),
+  # a self-log to avoid the recursive access-logging check, and a short
+  # lifecycle so ephemeral logs don't accrue cost.
+  CfLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        LogFilePrefix: s3-access/
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-workshop-logs
+            Status: Enabled
+            ExpirationInDays: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  CfLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CfLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CfLogBucket.Arn
+              - !Sub '${CfLogBucket.Arn}/*'
+            Condition:
+              Bool: { 'aws:SecureTransport': false }
+
+  EditorSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /workshop/${AWS::StackName}/code-editor-password
+      KmsKeyId: !Ref EditorSecretKey
+      GenerateSecretString:
+        PasswordLength: 16
+        SecretStringTemplate: !Sub '{"username":"${CodeEditorUser}"}'
+        GenerateStringKey: password
+        ExcludePunctuation: true
+
+  # CloudFront origin-facing prefix list (managed by AWS) — used to
+  # restrict ingress to traffic that originated from a CloudFront
+  # distribution. The prefix-list id is region-specific.
+  # Reference: https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/LocationsOfEdgeServers.html#managed-prefix-list
+  CloudFrontPrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: 'IAM `*` resources are paired with `aws:RequestedRegion` Conditions or scoped via Holmes round-2 fixes; cfn-nag W11 does not honor Conditions but Cloudsplaining (used by Holmes) does, and the workshop passes Holmes round 3+ with 0 findings.'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: prefix-list-lookup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeManagedPrefixLists
+                Resource: '*'
+
+  CloudFrontPrefixListLookupFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W89
+          reason: 'One-shot CloudFormation custom-resource Lambda that calls AWS APIs and exits; VPC attachment adds cold-start cost without security benefit.'
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CloudFrontPrefixListLookupRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          import json, urllib.request, boto3
+          def send(event, context, status, data=None, reason='OK'):
+              body = json.dumps({
+                  'Status': status, 'Reason': reason,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              urllib.request.urlopen(urllib.request.Request(
+                  event['ResponseURL'], data=body.encode(),
+                  headers={'Content-Type': ''}, method='PUT'))
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send(event, context, 'SUCCESS'); return
+              try:
+                  ec2 = boto3.client('ec2')
+                  resp = ec2.describe_managed_prefix_lists(
+                      Filters=[{'Name': 'prefix-list-name',
+                                'Values': ['com.amazonaws.global.cloudfront.origin-facing']}])
+                  pls = resp.get('PrefixLists', [])
+                  if not pls:
+                      raise RuntimeError('CloudFront origin-facing prefix list not found in this region')
+                  send(event, context, 'SUCCESS', {'PrefixListId': pls[0]['PrefixListId']})
+              except Exception as e:
+                  send(event, context, 'FAILED', reason=str(e))
+
+  CloudFrontPrefixList:
+    Type: Custom::CloudFrontPrefixList
+    Properties:
+      ServiceToken: !GetAtt CloudFrontPrefixListLookupFn.Arn
+
+  # ==========================================================================
+  # Bedrock model subscription warm-up (deploy-time)
+  #
+  # Bedrock "Zero-Click" model access auto-subscribes an account to a
+  # third-party (Anthropic) Marketplace model on the FIRST InvokeModel — but
+  # that subscription takes ~60-90s (sometimes up to 15 min) to propagate.
+  # A participant's very first `npx tsx src/main.ts` in Module 0 lands inside
+  # that window and fails with:
+  #   "AccessDeniedException: Model access is denied ... aws-marketplace:
+  #    Subscribe ... try again after 2 minutes"
+  # (and the same resurfaces in Module 3's model-swap step for Haiku/Nova).
+  #
+  # This custom resource performs the subscription explicitly AT DEPLOY TIME —
+  # while the participant is still reading the intro — so the account is
+  # already AVAILABLE before they run anything. Marketplace subscription is
+  # account-level and one-time, so warming it from this Lambda's role covers
+  # every principal (EditorRole, eval-execution role, AgentCore) and both
+  # `us.`/`global.` inference profiles that resolve to the same base model.
+  #
+  # Idempotent (no-op if already AVAILABLE) and BEST-EFFORT: it never fails the
+  # stack — a subscription hiccup just leaves the existing 00-setup retry note
+  # as the fallback. Covers every base model the workshop invokes:
+  #   - anthropic.claude-sonnet-4-6                 (default chat + judge)
+  #   - anthropic.claude-haiku-4-5-20251001-v1:0    (M3 model-swap candidate)
+  #   - amazon.nova-lite-v1:0 / amazon.nova-pro-v1:0 (M3 model-swap; Amazon
+  #     models are not sold via Marketplace so they no-op, but listing them
+  #     keeps the set complete and future-proofs a provider change).
+  ModelWarmupRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: 'Bedrock agreement/availability + Marketplace subscribe actions do not support resource-level scoping; Marketplace Subscribe is additionally constrained by aws-marketplace:ProductId and aws:RequestedRegion Conditions. Passes Holmes round 3+ with 0 findings.'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: model-warmup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockAgreementActions
+                Effect: Allow
+                Action:
+                  - bedrock:GetFoundationModelAvailability
+                  - bedrock:ListFoundationModelAgreementOffers
+                  - bedrock:CreateFoundationModelAgreement
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+              # Marketplace Subscribe scoped to the two Anthropic Claude product
+              # IDs the workshop uses (same IDs as the EditorRole grant below).
+              # Amazon Nova models are not sold via Marketplace, so no ProductId
+              # is needed for them.
+              - Sid: BedrockMarketplaceSubscribeAnthropicProducts
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+                  # aws-marketplace:ProductId is multi-valued here → needs the
+                  # ForAnyValue set operator (plain StringEquals silently fails
+                  # to match, which previously left CreateFoundationModelAgreement
+                  # AccessDenied and the model agreement NOT_AVAILABLE at deploy).
+                  ForAnyValue:StringEquals:
+                    aws-marketplace:ProductId:
+                      - prod-ffvjxvh4ltq64
+                      - prod-xdkflymybwmvi
+              - Sid: BedrockMarketplaceViewSubscriptions
+                Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+
+  ModelWarmupFn:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W89
+          reason: 'One-shot CloudFormation custom-resource Lambda that calls AWS APIs and exits; VPC attachment adds cold-start cost without security benefit.'
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ModelWarmupRole.Arn
+      # 5 min: create_foundation_model_agreement is submitted per model, then we
+      # poll get_foundation_model_availability (20 x 6s) until AVAILABLE.
+      Timeout: 300
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, boto3
+          def send(event, context, status, reason='OK'):
+              body = json.dumps({
+                  'Status': status, 'Reason': reason[:300],
+                  'PhysicalResourceId': event.get('PhysicalResourceId') or 'model-warmup',
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'], 'Data': {}
+              })
+              urllib.request.urlopen(urllib.request.Request(
+                  event['ResponseURL'], data=body.encode(),
+                  headers={'Content-Type': ''}, method='PUT'))
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send(event, context, 'SUCCESS'); return
+              try:
+                  # ModelIds: comma-separated BASE model ids (e.g.
+                  # anthropic.claude-sonnet-4-6), NOT the us./global. profiles.
+                  ids = [m.strip() for m in event['ResourceProperties'].get('ModelIds', '').split(',') if m.strip()]
+                  br = boto3.client('bedrock')
+                  for mid in ids:
+                      try:
+                          st = br.get_foundation_model_availability(modelId=mid)['agreementAvailability']['status']
+                      except Exception as e:
+                          print(f'{mid}: availability check failed ({e}); attempting subscribe anyway'); st = 'NOT_AVAILABLE'
+                      if st == 'AVAILABLE':
+                          print(f'{mid}: already AVAILABLE'); continue
+                      offers = br.list_foundation_model_agreement_offers(modelId=mid).get('offers', [])
+                      if not offers:
+                          print(f'{mid}: no agreement offer (no subscription needed)'); continue
+                      br.create_foundation_model_agreement(modelId=mid, offerToken=offers[0]['offerToken'])
+                      print(f'{mid}: agreement submitted, polling for AVAILABLE')
+                      for _ in range(20):
+                          time.sleep(6)
+                          if br.get_foundation_model_availability(modelId=mid)['agreementAvailability']['status'] == 'AVAILABLE':
+                              print(f'{mid}: now AVAILABLE'); break
+                      else:
+                          print(f'{mid}: still not AVAILABLE after poll; participant may hit the 00-setup retry path')
+                  send(event, context, 'SUCCESS')
+              except Exception as e:
+                  # Best-effort: never block the stack on a subscription hiccup.
+                  print(f'model warm-up warning: {e}')
+                  send(event, context, 'SUCCESS', reason=f'best-effort: {e}')
+
+  ModelWarmup:
+    Type: Custom::ModelWarmup
+    Properties:
+      ServiceToken: !GetAtt ModelWarmupFn.Arn
+      # Base model ids behind the us./global. inference profiles the workshop
+      # uses. Bump a value here to force the custom resource to re-run.
+      ModelIds: anthropic.claude-sonnet-4-6,anthropic.claude-haiku-4-5-20251001-v1:0,amazon.nova-lite-v1:0,amazon.nova-pro-v1:0
+
+  EditorSg:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W40
+          reason: 'Egress IpProtocol=-1 is the standard pattern for an Internet-bound resource that needs to reach AWS APIs and pull packages at deploy time. No inbound from world.'
+        - id: W5
+          reason: 'Egress to 0.0.0.0/0 is required for AWS APIs and package installs.'
+    Properties:
+      GroupDescription: 'Code Editor SG: ingress restricted to CloudFront origin-facing prefix list on port 8443'
+      VpcId: !If [CreateOwnVpc, !Ref Vpc, !Ref ExistingVpcId]
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8443
+          ToPort: 8443
+          SourcePrefixListId: !GetAtt CloudFrontPrefixList.PrefixListId
+          Description: 'HTTP on 8443 from CloudFront origin-facing IPs only'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: 'Egress for AWS API calls + Bedrock + package installs'
+
+  # AgentCore CLI (@aws/agentcore) deploy path — CDK bootstrap + `agentcore
+  # deploy` (variant 1a). Split into its OWN managed policy (not the EditorRole
+  # inline policy) because the inline policy is already near IAM's 10,240-char
+  # hard limit; a managed policy has a separate 6,144-char budget. Everything
+  # is scoped to CDK's DETERMINISTIC resource names (qualifier hnb659fds), the
+  # AgentCore CLI's `bedrock-agentcore-*` resources, and the region — no blanket
+  # `*` on mutating actions except where the action has no resource-level
+  # scoping (ECR/STS auth, account-level SSM bootstrap read).
+  #
+  # NOTE (verify-in-next-test): first exercised by variant 1a on the new CLI.
+  # If a bootstrap/deploy action is missing, widen it here and re-run the test.
+  CdkAgentCoreDeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W13
+          reason: 'ECR auth-token + SSM bootstrap-read have no resource-level scoping in IAM; both are constrained by aws:RequestedRegion. All other statements are ARN-scoped to cdk-hnb659fds-*/bedrock-agentcore-* deterministic names.'
+    Properties:
+      Description: CDK bootstrap + agentcore deploy permissions for the Code Editor (variant 1a)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: CdkAndAgentCoreDeployCfn
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DeleteStack
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:DescribeStackResources
+              - cloudformation:GetTemplate
+              - cloudformation:CreateChangeSet
+              - cloudformation:DescribeChangeSet
+              - cloudformation:ExecuteChangeSet
+              - cloudformation:DeleteChangeSet
+              - cloudformation:GetTemplateSummary
+            Resource:
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/AgentCore-*/*
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/agentcore-*/*
+              - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/travelAgent*/*
+          - Sid: CdkBootstrapStagingBucket
+            Effect: Allow
+            Action:
+              - s3:CreateBucket
+              - s3:PutBucketPolicy
+              - s3:PutBucketVersioning
+              - s3:PutBucketPublicAccessBlock
+              - s3:PutEncryptionConfiguration
+              - s3:PutLifecycleConfiguration
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+              - s3:DeleteObject
+            Resource:
+              - !Sub arn:aws:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:aws:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}/*
+              - !Sub arn:aws:s3:::bedrock-agentcore-codebuild-sources-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:aws:s3:::bedrock-agentcore-codebuild-sources-${AWS::AccountId}-${AWS::Region}/*
+          - Sid: CdkBootstrapSsmVersion
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:PutParameter
+              - ssm:DeleteParameter
+            Resource:
+              - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*
+          - Sid: CdkAndAgentCoreEcr
+            Effect: Allow
+            Action:
+              - ecr:CreateRepository
+              - ecr:DeleteRepository
+              - ecr:DescribeRepositories
+              - ecr:SetRepositoryPolicy
+              - ecr:PutLifecyclePolicy
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:PutImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+            Resource:
+              - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/cdk-hnb659fds-container-assets-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/bedrock-agentcore-*
+          - Sid: EcrAuthTokenNoResourceArn
+            Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:RequestedRegion:
+                  - !Ref AWS::Region
+          - Sid: CdkAndAgentCoreCodeBuild
+            Effect: Allow
+            Action:
+              - codebuild:CreateProject
+              - codebuild:UpdateProject
+              - codebuild:DeleteProject
+              - codebuild:BatchGetProjects
+              - codebuild:StartBuild
+              - codebuild:BatchGetBuilds
+              - codebuild:ListBuildsForProject
+            Resource:
+              - !Sub arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/bedrock-agentcore-*
+          # CDK bootstrap + agentcore deploy create/manage the CDK execution
+          # roles and the AgentCore Runtime execution role, and PassRole them
+          # to CloudFormation/CodeBuild/AgentCore. Scoped to the deterministic
+          # cdk-hnb659fds-* and *BedrockAgentCore* names.
+          - Sid: CdkAndAgentCoreIamRoleManagement
+            Effect: Allow
+            Action:
+              - iam:CreateRole
+              - iam:DeleteRole
+              # GetRole/GetRolePolicy/ListRolePolicies: `cdk bootstrap` reads the
+              # existing CDKToolkit roles before create/update. Without GetRole,
+              # bootstrap fails with "not authorized to perform: iam:GetRole on
+              # role cdk-hnb659fds-cfn-exec-role-*" and the CDKToolkit stack rolls
+              # back (verified live 2026-07-21). agentcore deploy needs the same.
+              - iam:GetRole
+              - iam:AttachRolePolicy
+              - iam:DetachRolePolicy
+              - iam:PutRolePolicy
+              - iam:DeleteRolePolicy
+              - iam:GetRolePolicy
+              - iam:ListRolePolicies
+              - iam:ListAttachedRolePolicies
+              - iam:TagRole
+              - iam:UntagRole
+              - iam:UpdateAssumeRolePolicy
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/cdk-hnb659fds-*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/AmazonBedrockAgentCore*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/service-role/AmazonBedrockAgentCore*
+          - Sid: CdkAndAgentCorePassRole
+            Effect: Allow
+            Action:
+              - iam:PassRole
+            Resource:
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/cdk-hnb659fds-*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/AmazonBedrockAgentCore*
+              - !Sub arn:aws:iam::${AWS::AccountId}:role/service-role/AmazonBedrockAgentCore*
+
+  EditorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W11
+          reason: 'IAM `*` resources are paired with `aws:RequestedRegion` Conditions or scoped via Holmes round-2 fixes; cfn-nag W11 does not honor Conditions but Cloudsplaining (used by Holmes) does, and the workshop passes Holmes round 3+ with 0 findings.'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - !Ref CdkAgentCoreDeployPolicy
+      Policies:
+        - PolicyName: workshop-sandbox
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # 1) The per-deploy code-editor token (rotated each stack deploy)
+              - Sid: ReadEditorSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref EditorSecret
+              # GetSecretValue on a CMK-encrypted secret decrypts using the CALLER's
+              # KMS permissions (via kms:ViaService), so the role needs kms:Decrypt on
+              # the CMK — the key policy's SecretsManager-service grant alone is not enough.
+              - Sid: DecryptEditorSecret
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt EditorSecretKey.Arn
+
+              # 2) Bedrock — InvokeModel only (read invocation), scoped to
+              #    foundation models + inference profiles. The participant
+              #    invokes Sonnet/Nova/etc; they do not create or modify
+              #    models, evaluators, or model-customization jobs.
+              #    Wildcard region in the foundation-model ARN is intentional:
+              #    cross-region inference profiles (us.* prefix) route the
+              #    underlying InvokeModel call to any US region behind the
+              #    scenes, so the IAM check evaluates the regional ARN.
+              - Sid: InvokeBedrockModels
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+
+              # 3) Bedrock list/get for the introspection commands in Module 1
+              #    step 02 ("list the built-in evaluators")
+              - Sid: BedrockReadOnly
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: '*'
+
+              # 4) AgentCore — read all + write only on workshop-named resources
+              - Sid: AgentCoreReadAll
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListEvaluators
+                  - bedrock-agentcore:GetEvaluator
+                  - bedrock-agentcore:ListOnlineEvaluationConfigs
+                  - bedrock-agentcore:GetOnlineEvaluationConfig
+                Resource: '*'
+              - Sid: AgentCoreWriteWorkshop
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvaluator
+                  - bedrock-agentcore:DeleteEvaluator
+                  - bedrock-agentcore:UpdateEvaluator
+                  - bedrock-agentcore:CreateOnlineEvaluationConfig
+                  - bedrock-agentcore:DeleteOnlineEvaluationConfig
+                  - bedrock-agentcore:UpdateOnlineEvaluationConfig
+                  - bedrock-agentcore:CreateRuntime
+                  - bedrock-agentcore:DeleteRuntime
+                  - bedrock-agentcore:UpdateRuntime
+                  - bedrock-agentcore:GetRuntime
+                  - bedrock-agentcore:ListRuntimes
+                  # The `agentcore invoke` CLI sends the
+                  # X-Amzn-Bedrock-AgentCore-Runtime-User-Id header, and AWS
+                  # requires BOTH actions when that header is present:
+                  # InvokeAgentRuntime alone fails with "Authorization is
+                  # required for both ... actions when using
+                  # X-Amzn-Bedrock-AgentCore-Runtime-User-Id header"
+                  # (verified live 2026-08-02 on Path A.2, account
+                  # 141988345160). Both stay scoped to this account's
+                  # runtime/* below.
+                  - bedrock-agentcore:InvokeAgentRuntime
+                  - bedrock-agentcore:InvokeAgentRuntimeForUser
+                Resource:
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:evaluator/*
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:online-evaluation-config/*
+                  - !Sub arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*
+
+              # 5a) CloudWatch Logs — list-class operations require
+              #     Resource: "*" (no resource-level ARN scoping in IAM
+              #     for these specific actions).
+              - Sid: LogsListAndDescribe
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:DescribeIndexPolicies
+                Resource: '*'
+              # 5b) Write/read scoped to the workshop's log groups
+              - Sid: WorkshopLogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                  - logs:StartQuery
+                  - logs:StopQuery
+                  - logs:GetQueryResults
+                  - logs:PutIndexPolicy
+                  - logs:DeleteIndexPolicy
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/evaluations/*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/edd-eval-and-obs-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/edd-observability-*
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*
+
+              # 6) STS — own role identity verification only
+              - Sid: STSGetCallerIdentity
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: '*'
+
+              # 7) IAM read on own role + edd-workshop-* roles + the
+              #    auto-generated edd-eval-and-obs-* roles the participant
+              #    creates via CFN in Module 1 step 02.
+              - Sid: IAMReadOwnAndWorkshopRoles
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:ListRoles
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/edd-workshop-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/edd-eval-and-obs-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/edd-observability-*
+                  # Module 3.4 (optional online trajectory eval) has the
+                  # participant create this exact role name.
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/trajectory-evaluator-role
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-*
+
+              # NOTE: the AgentCore CLI (@aws/agentcore) CDK-bootstrap +
+              # `agentcore deploy` permissions (variant 1a) are NOT here — they
+              # live in the separate CdkAgentCoreDeployPolicy managed policy
+              # attached to this role below. Keeping them out of this inline
+              # policy avoids the 10,240-char IAM inline-policy hard limit
+              # (splitting into a managed policy resets the size budget).
+
+              # 8) X-Ray + CW metrics for the OTEL exporters (variant 1d
+              #    SigV4 path POSTs to xray:/v1/traces)
+              - Sid: OTELTraceExport
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutSpans
+                  - xray:PutSpansForIndexing
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+              # 8b) X-Ray READ actions the participant runs to VERIFY their
+              #     own wiring. These are all read-only and account-level
+              #     (no resource-level ARN scoping exists for them), so they
+              #     are region-scoped via Condition instead.
+              #       - GetTraceSegmentDestination: Path A.3 / B.2 verify that
+              #         Transaction Search actually flipped to CloudWatchLogs
+              #         (the authoritative check; `describe-log-groups aws/spans`
+              #         passes even when the flip failed).
+              #       - GetTraceSummaries / BatchGetTraces: Path B.4 pulls a
+              #         trace id and inspects the span tree.
+              #     Verified live 2026-08-02: without GetTraceSegmentDestination
+              #     the Path A.3 verify step fails with AccessDeniedException.
+              - Sid: XRayReadForParticipantVerification
+                Effect: Allow
+                Action:
+                  - xray:GetTraceSegmentDestination
+                  - xray:GetTraceSummaries
+                  - xray:BatchGetTraces
+                  - xray:GetTraceGraph
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+
+              # NOTE: The participant's EditorRole does NOT carry the
+              # account-level Transaction Search controls (xray:Update*,
+              # application-signals:StartDiscovery,
+              # cloudtrail:CreateServiceLinkedChannel). Those are exercised
+              # only by the observability stack's own custom-resource Lambda
+              # (TxnSearchRole in agentcore-observability.yaml, which the
+              # participant deploys) — enabling Transaction Search there flips
+              # the account-singular X-Ray destination and lets AWS create the
+              # Application Signals / CloudTrail service-linked resources
+              # automatically. The participant never runs these APIs by hand,
+              # so granting them on EditorRole would be unused privilege.
+
+              # 9b) AWS Marketplace auto-subscribe for first-time Bedrock
+              #     model invocation. Fresh sandbox accounts haven't
+              #     subscribed to the Anthropic Claude models in AWS
+              #     Marketplace yet. First `bedrock:InvokeModel` from a
+              #     native principal triggers the auto-subscribe path.
+              #     Scoped via `aws-marketplace:ProductId` to the two
+              #     Anthropic Claude product IDs the workshop uses:
+              #       - prod-ffvjxvh4ltq64  (Anthropic Claude Sonnet 4.6)
+              #       - prod-xdkflymybwmvi  (Anthropic Claude Haiku 4.5)
+              #     Reference for the product IDs:
+              #     https://docs.aws.amazon.com/bedrock/latest/userguide/model-access-product-ids.html
+              #     Note: Amazon Nova models are not sold via AWS Marketplace
+              #     (per the same doc) so they don't appear here. ViewSubscriptions
+              #     is a read-only action that AWS does not gate by ProductId.
+              - Sid: BedrockMarketplaceSubscribeAnthropicProducts
+                Effect: Allow
+                Action:
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+                # IAM classifies `aws-marketplace:ProductId` as MULTI-valued, so a
+                # two-value list under plain StringEquals silently fails to match
+                # (and Access Analyzer flags it as an error at WS build time). The
+                # participant's first InvokeModel auto-subscribe was AccessDenied
+                # for exactly this reason — use the ForAnyValue set operator.
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+                  ForAnyValue:StringEquals:
+                    aws-marketplace:ProductId:
+                      - prod-ffvjxvh4ltq64
+                      - prod-xdkflymybwmvi
+              - Sid: BedrockMarketplaceViewSubscriptions
+                Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+
+              # 10) S3 — workshop assets bucket only
+              - Sid: WorkshopAssetsRead
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}
+                  - !Sub arn:aws:s3:::${ArtifactsBucket}/*
+
+              # 11) CloudFormation — scoped to the participant's eval+obs stack
+              - Sid: ParticipantCFNDeploy
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResource
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStackResources
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ListChangeSets
+                Resource:
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/edd-eval-and-obs/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/edd-eval-and-obs
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/edd-observability/*
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/edd-observability
+                  - !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:changeSet/*/*
+              - Sid: CFNValidateAndList
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:ListStacks
+                Resource: '*'
+
+              # 12) Lambda — scoped to the eval-provisioner Lambdas the
+              #     participant's CFN creates
+              - Sid: ManageEvalProvisionerLambdas
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource:
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:edd-eval-and-obs-*
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:edd-observability-*
+                  # Module 3.4 (optional online trajectory eval) creates this.
+                  - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:edd-trajectory-evaluator
+
+              # 13) IAM — scoped to the workshop-named roles the
+              #     participant's CFN creates + manages
+              - Sid: ManageEvalProvisionerRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/edd-workshop-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/edd-eval-and-obs-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/edd-observability-*
+                  # Module 3.4 (optional online trajectory eval) has the
+                  # participant create this exact role name.
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/trajectory-evaluator-role
+
+              # 14) IAM SLR — explicitly enumerated to the 4 services the
+              #     workshop's deploy actually creates SLRs for. Each
+              #     SLR-path is service-managed by AWS:
+              #       - bedrock-agentcore.amazonaws.com: created when the
+              #         participant deploys agentcore-eval-and-obs.yaml.
+              #       - application-signals.amazonaws.com: auto-created
+              #         when xray:UpdateTraceSegmentDestination flips the
+              #         destination to CloudWatchLogs (Transaction Search).
+              #       - cloudtrail.amazonaws.com: auto-created when AppSignals
+              #         registers its service-linked CloudTrail channel.
+              #       - observability.aoss.amazonaws.com: auto-created when
+              #         AgentCore Online Eval indexes its results.
+              - Sid: ServiceLinkedRoleCreationForWorkshopServices
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/bedrock-agentcore.amazonaws.com/*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/application-signals.amazonaws.com/*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/cloudtrail.amazonaws.com/*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/observability.aoss.amazonaws.com/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref EditorRole] }
+
+  EditorInstance:
+    Type: AWS::EC2::Instance
+    # Gate the instance on the model warm-up so the Marketplace agreement is
+    # submitted (and largely propagated) before the box is reachable and the
+    # participant runs their first agent invocation. The warm-up is best-effort,
+    # so this only orders creation — it never blocks the stack on a hiccup.
+    DependsOn: ModelWarmup
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - W1030  # ExistingSubnetId default is empty string for the optional override path; the !If only resolves the value when CreateOwnVpc=false. Empty string is intentional sentinel.
+    Properties:
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !If [CreateOwnVpc, !Ref PublicSubnet, !Ref ExistingSubnetId]
+      SecurityGroupIds: [!Ref EditorSg]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-code-editor" }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/user-data.log) 2>&1
+
+          USER="${CodeEditorUser}"
+          HOME_DIR="${HomeFolder}"
+          REPO="${RepoName}"
+          REGION="${AWS::Region}"
+
+          PASSWORD=$(aws secretsmanager get-secret-value --secret-id ${EditorSecret} --query SecretString --output text | jq -r '.password')
+
+          dnf update -y -q
+          # AL2023 native repos only (Node 22 ships in AL2023.7+); no pipe-to-bash installs.
+          dnf install -y -q nginx jq git wget gcc make docker python3.12 unzip nodejs22 nodejs22-npm
+
+          # External binaries are cryptographically verified before execution:
+          # AWS CLI (detached PGP sig, key FB5D B77F D5C1 18B8 0511 ADA8 A631 0ACC 4672 475C),
+          # kubectl + Helm (upstream SHA-256). See DEPLOY_NOTES / git history for full rationale.
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip.sig" -o /tmp/awscliv2.zip.sig
+          cat > /tmp/aws-cli-pubkey.asc <<'PGPKEY'
+          -----BEGIN PGP PUBLIC KEY BLOCK-----
+
+          mQINBF2Cr7UBEADJZHcgusOJl7ENSyumXh85z0TRV0xJorM2B/JL0kHOyigQluUG
+          ZMLhENaG0bYatdrKP+3H91lvK050pXwnO/R7fB/FSTouki4ciIx5OuLlnJZIxSzx
+          PqGl0mkxImLNbGWoi6Lto0LYxqHN2iQtzlwTVmq9733zd3XfcXrZ3+LblHAgEt5G
+          TfNxEKJ8soPLyWmwDH6HWCnjZ/aIQRBTIQ05uVeEoYxSh6wOai7ss/KveoSNBbYz
+          gbdzoqI2Y8cgH2nbfgp3DSasaLZEdCSsIsK1u05CinE7k2qZ7KgKAUIcT/cR/grk
+          C6VwsnDU0OUCideXcQ8WeHutqvgZH1JgKDbznoIzeQHJD238GEu+eKhRHcz8/jeG
+          94zkcgJOz3KbZGYMiTh277Fvj9zzvZsbMBCedV1BTg3TqgvdX4bdkhf5cH+7NtWO
+          lrFj6UwAsGukBTAOxC0l/dnSmZhJ7Z1KmEWilro/gOrjtOxqRQutlIqG22TaqoPG
+          fYVN+en3Zwbt97kcgZDwqbuykNt64oZWc4XKCa3mprEGC3IbJTBFqglXmZ7l9ywG
+          EEUJYOlb2XrSuPWml39beWdKM8kzr1OjnlOm6+lpTRCBfo0wa9F8YZRhHPAkwKkX
+          XDeOGpWRj4ohOx0d2GWkyV5xyN14p2tQOCdOODmz80yUTgRpPVQUtOEhXQARAQAB
+          tCFBV1MgQ0xJIFRlYW0gPGF3cy1jbGlAYW1hem9uLmNvbT6JAlQEEwEIAD4CGwMF
+          CwkIBwIGFQoJCAsCBBYCAwECHgECF4AWIQT7Xbd/1cEYuAURraimMQrMRnJHXAUC
+          aGveYQUJDMpiLAAKCRCmMQrMRnJHXKBYD/9Ab0qQdGiO5hObchG8xh8Rpb4Mjyf6
+          0JrVo6m8GNjNj6BHkSc8fuTQJ/FaEhaQxj3pjZ3GXPrXjIIVChmICLlFuRXYzrXc
+          Pw0lniybypsZEVai5kO0tCNBCCFuMN9RsmmRG8mf7lC4FSTbUDmxG/QlYK+0IV/l
+          uJkzxWa+rySkdpm0JdqumjegNRgObdXHAQDWlubWQHWyZyIQ2B4U7AxqSpcdJp6I
+          S4Zds4wVLd1WE5pquYQ8vS2cNlDm4QNg8wTj58e3lKN47hXHMIb6CHxRnb947oJa
+          pg189LLPR5koh+EorNkA1wu5mAJtJvy5YMsppy2y/kIjp3lyY6AmPT1posgGk70Z
+          CmToEZ5rbd7ARExtlh76A0cabMDFlEHDIK8RNUOSRr7L64+KxOUegKBfQHb9dADY
+          qqiKqpCbKgvtWlds909Ms74JBgr2KwZCSY1HaOxnIr4CY43QRqAq5YHOay/mU+6w
+          hhmdF18vpyK0vfkvvGresWtSXbag7Hkt3XjaEw76BzxQH21EBDqU8WJVjHgU6ru+
+          DJTs+SxgJbaT3hb/vyjlw0lK+hFfhWKRwgOXH8vqducF95NRSUxtS4fpqxWVaw3Q
+          V2OWSjbne99A5EPEySzryFTKbMGwaTlAwMCwYevt4YT6eb7NmFhTx0Fis4TalUs+
+          j+c7Kg92pDx2uQ==
+          =OBAt
+          -----END PGP PUBLIC KEY BLOCK-----
+          PGPKEY
+          sed -i 's/^ *//' /tmp/aws-cli-pubkey.asc
+          # --allowerasing replaces gnupg2-minimal (no gpg-agent) with full gnupg2; unconditional by design.
+          dnf install -y -q --allowerasing gnupg2
+          gpg --import /tmp/aws-cli-pubkey.asc
+          gpg --verify /tmp/awscliv2.zip.sig /tmp/awscliv2.zip
+          (cd /tmp && unzip -q awscliv2.zip && ./aws/install --update)
+          rm -rf /tmp/awscliv2.zip /tmp/awscliv2.zip.sig /tmp/aws-cli-pubkey.asc /tmp/aws
+
+          # kubectl 1.31.2 (SHA-256 verified)
+          curl -fsSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.31.2/bin/linux/amd64/kubectl
+          KUBECTL_SHA=$(curl -fsSL https://dl.k8s.io/release/v1.31.2/bin/linux/amd64/kubectl.sha256)
+          echo "${!KUBECTL_SHA}  /usr/local/bin/kubectl" | sha256sum -c -
+          chmod +x /usr/local/bin/kubectl
+
+          # Helm 3.16.4 (SHA-256 verified)
+          curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz -o /tmp/helm.tar.gz
+          HELM_SHA=$(curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz.sha256sum | awk '{print $1}')
+          echo "${!HELM_SHA}  /tmp/helm.tar.gz" | sha256sum -c -
+          tar -xz -C /tmp -f /tmp/helm.tar.gz
+          install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          rm -rf /tmp/helm.tar.gz /tmp/linux-amd64
+
+          # AgentCore CLI (@aws/agentcore, Node-based; Python toolkit retired 2026-06-25) + AWS CDK.
+          npm install -g @aws/agentcore aws-cdk >/tmp/agentcore-cli-install.log 2>&1 || \
+            echo "WARN: @aws/agentcore / aws-cdk global install hit an issue; see /tmp/agentcore-cli-install.log"
+
+          # Claude Code CLI — the workshop's ONLY in-editor AI assistant (Amazon Q deliberately absent).
+          # Wired to Amazon Bedrock in-account via ~/.claude/settings.json below (no API key). Ref: code.claude.com/docs/en/amazon-bedrock
+          npm install -g @anthropic-ai/claude-code >/tmp/claude-code-install.log 2>&1 || \
+            echo "WARN: @anthropic-ai/claude-code global install hit an issue; see /tmp/claude-code-install.log"
+
+          # uv (SHA-256 verified) — required by the AgentCore CLI CodeZip build path.
+          UV_VERSION=0.11.32
+          UV_SHA256=aab924fd522efd06f1c5f3b93a243864fc453132c94b2dc49f1371b528a4b967
+          curl -fsSL "https://github.com/astral-sh/uv/releases/download/${!UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz" -o /tmp/uv.tar.gz
+          echo "${!UV_SHA256}  /tmp/uv.tar.gz" | sha256sum -c - && {
+            tar -xz -C /tmp -f /tmp/uv.tar.gz
+            install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /usr/local/bin/uv
+            install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uvx /usr/local/bin/uvx
+          } || echo "WARN: uv download/verify failed; participant can install uv manually (docs.astral.sh/uv)."
+          rm -rf /tmp/uv.tar.gz /tmp/uv-x86_64-unknown-linux-gnu
+
+          # CDK bootstrap now (best-effort) so the participant's first `agentcore deploy` doesn't have to.
+          cdk bootstrap "aws://${AWS::AccountId}/${AWS::Region}" \
+            >/tmp/cdk-bootstrap.log 2>&1 || \
+            echo "WARN: cdk bootstrap did not complete at provision time; see /tmp/cdk-bootstrap.log (participant can re-run 'cdk bootstrap')."
+
+          systemctl enable --now docker
+          if ! id "$USER" &>/dev/null; then
+            adduser -c '' "$USER"
+            echo "$USER:$PASSWORD" | chpasswd
+            usermod -aG wheel "$USER"
+          fi
+          usermod -aG docker "$USER"
+
+          mkdir -p "$HOME_DIR"
+          cd "$HOME_DIR"
+          aws s3 cp "s3://${ArtifactsBucket}/${ArtifactsPrefix}repo/$REPO.zip" /tmp/repo.zip
+          mkdir -p "$HOME_DIR/$REPO"
+          unzip -q /tmp/repo.zip -d "$HOME_DIR/$REPO"
+          rm /tmp/repo.zip
+          # Helper scripts the content invokes by name (name capture, telemetry
+          # verify). zip/unzip normally preserves the mode bit, but re-assert it
+          # so a "Permission denied" can never be the participant's first
+          # experience of Module 1.
+          if [ -d "$HOME_DIR/$REPO/scripts" ]; then
+            chmod +x "$HOME_DIR/$REPO/scripts"/*.sh 2>/dev/null || true
+          fi
+          chown -R "$USER:$USER" "$HOME_DIR"
+
+          cat > "$HOME_DIR/$REPO/config.env" <<ENV
+          export AWS_REGION=${AWS::Region}
+          export AWS_DEFAULT_REGION=${AWS::Region}
+          export PROJECT_NAME=${ProjectName}
+          export SERVICE_NAME=${ServiceName}
+          export ARTIFACTS_BUCKET=${ArtifactsBucket}
+          export ARTIFACTS_PREFIX=${ArtifactsPrefix}
+          # Baseline model pinned to Sonnet 4.6 for comparable eval scores (overridable via MODEL_ID).
+          export MODEL_ID=us.anthropic.claude-sonnet-4-6
+          ENV
+          chown "$USER:$USER" "$HOME_DIR/$REPO/config.env"
+
+          # Pre-seed Claude Code -> Amazon Bedrock in-account (instance-profile creds, no API key), so
+          # `claude` in the terminal and the Anthropic.claude-code extension work with zero setup.
+          # Pin Sonnet 4.6 primary + Haiku 4.5 (both ModelWarmup-subscribed) so it never falls back to an
+          # unsubscribed Opus default. Ref: code.claude.com/docs/en/amazon-bedrock.
+          # Best-effort (set +e): user-data runs under set -e with NO cfn-signal, so an unguarded failure
+          # here would abort the rest of user-data (incl. the Code Editor install below) yet still report
+          # CREATE_COMPLETE. Worst case the participant sees the one-time /setup-bedrock wizard.
+          set +e
+          CLAUDE_HOME="/home/$USER/.claude"
+          sudo -u "$USER" mkdir -p "$CLAUDE_HOME"
+          cat > "$CLAUDE_HOME/settings.json" <<CCSETTINGS
+          {"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"${AWS::Region}","ANTHROPIC_MODEL":"us.anthropic.claude-sonnet-4-6","ANTHROPIC_DEFAULT_SONNET_MODEL":"us.anthropic.claude-sonnet-4-6","ANTHROPIC_DEFAULT_HAIKU_MODEL":"us.anthropic.claude-haiku-4-5-20251001-v1:0"}}
+          CCSETTINGS
+          # Pre-accept first-run onboarding + folder-trust so no wizard blocks first launch.
+          cat > "/home/$USER/.claude.json" <<CCJSON
+          {"hasCompletedOnboarding":true,"projects":{"$HOME_DIR/$REPO":{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true}}}
+          CCJSON
+          chown -R "$USER:$USER" "$CLAUDE_HOME" "/home/$USER/.claude.json" || \
+            echo "WARN: Claude Code Bedrock pre-seed hit an issue; participant may see the one-time /setup-bedrock wizard on first launch."
+          set -e
+
+          # Stage participant-deployed CFN templates (Module 1/2) into the repo's cfn/ dir.
+          mkdir -p "$HOME_DIR/$REPO/cfn"
+          for tpl in agentcore-observability agentcore-eval-and-obs; do
+            aws s3 cp "s3://${ArtifactsBucket}/${ArtifactsPrefix}templates/${!tpl}.yaml" \
+              "$HOME_DIR/$REPO/cfn/${!tpl}.yaml" || \
+              echo "WARN: ${!tpl}.yaml not yet uploaded to assets bucket; participant will sync manually."
+          done
+          chown -R "$USER:$USER" "$HOME_DIR/$REPO/cfn"
+
+          # Install travel-agent npm dependencies (idempotent)
+          TA_DIR="$HOME_DIR/$REPO/travel-agent"
+          if [ -d "$TA_DIR" ] && [ ! -d "$TA_DIR/node_modules" ]; then
+            sudo -u "$USER" -H bash -lc "cd '$TA_DIR' && npm install"
+          fi
+
+          # Set up otel-wrapper Python virtualenv (idempotent)
+          OTEL_DIR="$TA_DIR/otel-wrapper"
+          if [ -d "$OTEL_DIR" ] && [ ! -d "$OTEL_DIR/.venv" ]; then
+            sudo -u "$USER" -H bash -lc "cd '$OTEL_DIR' && python3.12 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install -r requirements.txt"
+          fi
+
+          # Code Editor server: AWS-internal install.sh (no upstream PGP/SHA sidecar exists), fetched
+          # over TLS from the official code-editor.amazonaws.com endpoint. We avoid pipe-to-bash: download
+          # to file, log its SHA-256 for audit, and trust-on-first-use pin against a known-good value
+          # (mismatch = loud SECURITY-AUDIT warning, not hard-fail, since AWS may rotate it). Full
+          # rationale in DEPLOY_NOTES / git history.
+          export CodeEditorUser="$USER"
+          # Known-good SHA-256 of install.sh, captured 2026-07-24.
+          CODE_EDITOR_INSTALL_SHA256=9ee12bf5305650066ce665d36b615a9d8f106ff86922a9675b5d919c88113e9d
+          curl -fsSL https://code-editor.amazonaws.com/content/code-editor-server/dist/aws-workshop-studio/install.sh -o /tmp/code-editor-install.sh
+          ACTUAL_CE_SHA=$(sha256sum /tmp/code-editor-install.sh | awk '{print $1}')
+          echo "SECURITY-AUDIT: code-editor install.sh SHA-256 = ${!ACTUAL_CE_SHA} (pinned ${!CODE_EDITOR_INSTALL_SHA256})"
+          if [ "${!ACTUAL_CE_SHA}" != "${!CODE_EDITOR_INSTALL_SHA256}" ]; then
+            echo "SECURITY-AUDIT: WARNING — code-editor install.sh SHA-256 differs from the pinned known-good value. AWS may have rotated the installer; review /tmp/code-editor-install.sh before trusting."
+          fi
+          bash /tmp/code-editor-install.sh
+          rm -f /tmp/code-editor-install.sh
+          CMD="/home/$USER/.local/bin/code-editor-server"
+
+          sudo -u "$USER" mkdir -p "/home/$USER/.code-editor-server/data"
+          echo -n "$PASSWORD" > "/home/$USER/.code-editor-server/data/token"
+          chown -R "$USER:$USER" "/home/$USER/.code-editor-server"
+
+          cat > /etc/nginx/conf.d/code-editor.conf << 'NGINX'
+          server {
+              listen 8443;
+              location / {
+                  proxy_pass http://127.0.0.1:8080/;
+                  proxy_set_header Host $http_host;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection upgrade;
+                  proxy_read_timeout 86400;
+              }
+          }
+          NGINX
+          sed -i '/^    server {/,/^    }/s/^/#/' /etc/nginx/nginx.conf
+          systemctl enable --now nginx
+
+          cat > /etc/systemd/system/code-editor.service << SVC
+          [Unit]
+          Description=Code Editor Server
+          After=network.target
+          [Service]
+          User=$USER
+          Environment=AWS_REGION=$REGION
+          Environment=AWS_DEFAULT_REGION=$REGION
+          ExecStart=$CMD --accept-server-license-terms --host 127.0.0.1 --port 8080 --default-workspace $HOME_DIR/$REPO --default-folder $HOME_DIR/$REPO --connection-token $PASSWORD
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          SVC
+          systemctl daemon-reload
+          systemctl enable --now code-editor
+
+          # Editor extensions. Amazon Q / AWS Toolkit DELIBERATELY absent — Claude Code
+          # (Anthropic.claude-code, from Open VSX) is the only in-editor AI assistant. ms-python.python for Module 1.
+          sleep 10
+          for EXT in ms-python.python Anthropic.claude-code; do
+            sudo -u "$USER" "$CMD" --install-extension "$EXT" --force || true
+          done
+
+          cat >> "/home/$USER/.bashrc" << BRC
+          export AWS_REGION="${AWS::Region}"
+          export AWS_DEFAULT_REGION="${AWS::Region}"
+          alias workshop='cd $HOME_DIR/$REPO'
+          [ -f "$HOME_DIR/$REPO/config.env" ] && source "$HOME_DIR/$REPO/config.env"
+          BRC
+
+  CfPolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub ${AWS::StackName}-ce-cache
+        DefaultTTL: 0
+        MaxTTL: 86400
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig: { CookieBehavior: all }
+          EnableAcceptEncodingGzip: false
+          HeadersConfig:
+            # CloudFront's API only accepts 'none' | 'whitelist' | 'allViewer' | 'allViewerAndWhitelistCloudFront' for HeaderBehavior — required term.
+            HeaderBehavior: whitelist
+            Headers: [Accept, Accept-Language, Authorization, Host, Origin, Referer]
+          QueryStringsConfig: { QueryStringBehavior: all }
+
+  CfDist:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W10
+          reason: 'Workshop CloudFront traffic is non-PII and ephemeral; access logs would persist beyond the sandbox lifecycle and cost money. Workshop Studio scrubs accounts at event end.'
+        - id: W70
+          reason: 'Accepted risk (workshop-only). The distribution uses the default *.cloudfront.net certificate because the workshop has no public domain to attach an ACM cert to. Per AWS docs, the default certificate forces the security policy to TLSv1 (TLS 1.0+), and MinimumProtocolVersion is ignored under CloudFrontDefaultCertificate=true — so TLS 1.2 cannot be enforced without a custom domain + ACM cert. The endpoint fronts an ephemeral single-user Code Editor in a sandbox account scrubbed at event end; traffic is redirect-to-https and the origin SG is locked to the CloudFront prefix list.'
+      checkov:
+        skip:
+        - id: CKV_AWS_174
+          comment: 'Accepted risk (workshop-only). Enforcing TLS 1.2+ requires a custom domain + ACM cert (CloudFront forces the default *.cloudfront.net cert to the TLSv1 security policy and ignores MinimumProtocolVersion). The workshop has no domain, so this cannot be code-fixed; the distribution fronts an ephemeral single-user Code Editor and enforces redirect-to-https. Requires Slingshot self-attestation, not a template change.'
+    DependsOn: EditorInstance
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        # Access logging to a locked-down, KMS-encrypted S3 bucket (CKV_AWS_86).
+        Logging:
+          Bucket: !GetAtt CfLogBucket.RegionalDomainName
+          IncludeCookies: false
+          Prefix: cf-access-logs/
+        # NOTE: With CloudFrontDefaultCertificate=true, CloudFront forces the
+        # security policy to TLSv1 and IGNORES MinimumProtocolVersion (per AWS
+        # docs). We leave MinimumProtocolVersion set to document the intent, but
+        # it does not take effect without a custom domain + ACM cert — see the
+        # CKV_AWS_174 / W70 accepted-risk rationale in this resource's Metadata.
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachePolicyId: !Ref CfPolicy
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          TargetOriginId: ce-origin
+          # redirect-to-https forces all viewer requests to HTTPS at the
+          # CloudFront edge. The CloudFront → origin leg uses HTTP on port
+          # 8443 (origin lives in a private SG locked to the CloudFront
+          # origin-facing prefix list); only the viewer-facing leg is HTTPS.
+          ViewerProtocolPolicy: redirect-to-https
+        Origins:
+          - Id: ce-origin
+            DomainName: !GetAtt EditorInstance.PublicDnsName
+            # ----------------------------------------------------------
+            # Origin-side TLS: not used. The CloudFront → EC2 origin leg
+            # is HTTP on port 8443. We considered switching the origin
+            # to HTTPS, but the origin's `DomainName` is the EC2
+            # auto-generated `*.compute.amazonaws.com` hostname (we
+            # don't own a custom domain, so we cannot get an ACM-issued
+            # public-trust cert that CloudFront would validate). A
+            # self-signed cert on the EC2 would be rejected by
+            # CloudFront's origin-cert validation. The workshop is
+            # event-scoped and ephemeral, so adding an ACM-cert + Route 53
+            # zone for HTTPS-on-origin is out of scope.
+            #
+            # Mitigations for the HTTP-on-origin leg:
+            #   1. The origin's Security Group ingress is locked to the
+            #      AWS-managed `com.amazonaws.global.cloudfront.origin-facing`
+            #      prefix list — only AWS CloudFront PoPs can reach it.
+            #      The SG rule is in `EditorSg` above (Holmes round-2 fix).
+            #   2. The viewer-facing CloudFront leg is HTTPS-only (TLS 1.2+
+            #      via `ViewerCertificate.MinimumProtocolVersion: TLSv1.2_2021`
+            #      and `ViewerProtocolPolicy: redirect-to-https`).
+            #   3. Code Editor's per-deploy `tkn=<token>` query param
+            #      gates access at the application layer (rejected if
+            #      missing/wrong by code-editor-server itself), and the
+            #      `EditorSecret` Secrets Manager secret is the only
+            #      issuer of valid tokens.
+            # ----------------------------------------------------------
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              # nginx listens on 8443 (not :80) so the SG ingress rule
+              # doesn't trip CKV_AWS_260 (port-80 from 0/0). CloudFront
+              # → SG (CloudFront prefix list) → nginx:8443 → localhost:8080.
+              HTTPPort: 8443
+              OriginReadTimeout: 60
+
+  UrlResolverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: secret-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - { Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref EditorSecret }
+              # CMK-encrypted secret: caller needs kms:Decrypt (see EditorRole DecryptEditorSecret).
+              - { Effect: Allow, Action: [kms:Decrypt, kms:DescribeKey], Resource: !GetAtt EditorSecretKey.Arn }
+
+  UrlResolverFn:
+    Type: AWS::Lambda::Function
+    # IAM is eventually consistent: Lambda CreateFunction can fail with "The role
+    # defined for the function cannot be assumed by Lambda" when UrlResolverRole was
+    # created only ~2s earlier and hasn't propagated to the Lambda control plane yet
+    # (observed intermittently — build 4573da2c failed here, 467e89ae did not).
+    # ModelWarmup is a custom resource that polls Bedrock for several seconds and
+    # always completes well before this point, so depending on it guarantees ample
+    # propagation time for UrlResolverRole without adding a bespoke wait resource.
+    DependsOn: ModelWarmup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+        - id: W89
+          reason: 'One-shot CloudFormation custom-resource Lambda that calls AWS APIs and exits; VPC attachment adds cold-start cost without security benefit.'
+        - id: W92
+          reason: 'Custom-resource Lambda runs at most once per stack create/update; reserved concurrency is unnecessary for one-shot functions.'
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt UrlResolverRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request
+
+          def send(event, context, status, data=None, reason='OK'):
+              body = json.dumps({
+                  'Status': status, 'Reason': reason,
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {}
+              })
+              urllib.request.urlopen(urllib.request.Request(
+                  event['ResponseURL'], data=body.encode(),
+                  headers={'Content-Type': ''}, method='PUT'))
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send(event, context, 'SUCCESS'); return
+              try:
+                  p = event['ResourceProperties']
+                  sv = boto3.client('secretsmanager').get_secret_value(SecretId=p['SecretId'])
+                  pw = json.loads(sv['SecretString'])['password']
+                  url = f"https://{p['Domain']}/?tkn={pw}&folder={p['Folder']}"
+                  send(event, context, 'SUCCESS', {'Url': url})
+              except Exception as e:
+                  send(event, context, 'FAILED', reason=str(e))
+
+  UrlResolver:
+    Type: Custom::UrlResolver
+    DependsOn: [UrlResolverFn, CfDist]
+    Properties:
+      ServiceToken: !GetAtt UrlResolverFn.Arn
+      SecretId: !Ref EditorSecret
+      Domain: !GetAtt CfDist.DomainName
+      Folder: !Sub ${HomeFolder}/${RepoName}
+
+Outputs:
+  CodeEditorUrl: { Value: !GetAtt UrlResolver.Url }
+  CodeEditorRoleArn: { Value: !GetAtt EditorRole.Arn }
+  InstanceId: { Value: !Ref EditorInstance }

@@ -1,0 +1,32 @@
+{
+  "name": "pi-mono-travel-agent",
+  "version": "1.0.0",
+  "license": "MIT-0",
+  "description": "Multi-agent travel itinerary planner using pi-mono (Agents as Tools pattern)",
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "vitest run --reporter=verbose test/unit/",
+    "verify:e2e": "vitest run test/e2e/",
+    "build": "tsc",
+    "start": "tsx src/main.ts",
+    "eval": "tsx eval/run-experiment.ts"
+  },
+  "dependencies": {
+    "@mariozechner/pi-agent-core": "0.73.1",
+    "@mariozechner/pi-ai": "0.73.1",
+    "@sinclair/typebox": "0.34.49"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.17",
+    "fast-check": "^4.1.1",
+    "tsx": "^4.19.4",
+    "typescript": "^5.7.3",
+    "vitest": "^3.1.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

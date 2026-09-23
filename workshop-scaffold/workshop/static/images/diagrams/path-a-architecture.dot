@@ -1,0 +1,34 @@
+
+digraph G {
+
+  graph [fontname="Helvetica", fontsize=11, bgcolor="white",
+         rankdir=TB, nodesep=0.35, ranksep=0.45, pad=0.25];
+  node  [fontname="Helvetica", fontsize=11, shape=box, style="rounded,filled",
+         color="#232F3E", fillcolor="#F7F8FA", fontcolor="#232F3E", penwidth=1.2,
+         margin="0.18,0.11"];
+  edge  [fontname="Helvetica", fontsize=9, color="#5A6B7B", fontcolor="#5A6B7B",
+         penwidth=1.1, arrowsize=0.8];
+
+  subgraph cluster_ec2 {
+    label="Code Editor EC2  (you author and deploy here)";
+    fontname="Helvetica"; fontsize=10; fontcolor="#5A6B7B";
+    style="rounded,dashed"; color="#5A6B7B";
+    cli [label="agentcore deploy", fillcolor="white"];
+  }
+
+  subgraph cluster_rt {
+    label="AgentCore Runtime  (managed: your agent's production home)";
+    fontname="Helvetica"; fontsize=10; fontcolor="#5A6B7B";
+    style="rounded"; color="#232F3E"; bgcolor="#FBFCFD";
+    container [label="Your container\nStrands agent + 3 tools", fillcolor="#F7F8FA"];
+    sidecar [label="OTEL sidecar  (injected for you)\nemits records, exports spans,\nstamps service.name", fillcolor="#EAF1F8"];
+    container -> sidecar [label="  lifecycle events"];
+  }
+
+  obs [label="AgentCore Observability\naws/spans + runtime log group", fillcolor="#EAF1F8"];
+  eval [label="Online Evaluation\nscores each session  (Module 2)", fillcolor="#EAF1F8"];
+
+  cli -> container [label="  CodeZip + CDK"];
+  sidecar -> obs [label="  OTLP", color="#FF9900", fontcolor="#FF9900", penwidth=1.6];
+  obs -> eval;
+}

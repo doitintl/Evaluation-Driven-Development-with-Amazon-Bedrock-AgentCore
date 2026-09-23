@@ -1,0 +1,17 @@
+templates:
+  - infrastructure/stacks/*.yaml
+  - workshop/static/main-stack.yaml
+
+# Globally ignored rules with documented rationale.
+ignore_checks:
+  # cfn-lint's IAM action catalog is stale for newer Bedrock + AgentCore +
+  # CloudTrail actions (e.g. bedrock:Converse, bedrock:ConverseStream,
+  # bedrock-agentcore:CreateRuntime/Get/Update/Delete/ListRuntime,
+  # cloudtrail:DescribeServiceLinkedChannels). These are valid, GA actions;
+  # the W3037 false positives don't represent real findings.
+  - W3037
+
+  # DependsOn redundancy with implicit Ref/GetAtt ordering. Flagged 29 times
+  # across orchestration stacks where DependsOn was added defensively.
+  # Cosmetic; doesn't affect deployment behavior.
+  - W3005

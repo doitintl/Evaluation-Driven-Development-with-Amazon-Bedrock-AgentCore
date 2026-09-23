@@ -1,0 +1,39 @@
+{
+  "name": "travelAgentStrands",
+  "version": 1,
+  "managedBy": "CDK",
+  "tags": {
+    "agentcore:created-by": "agentcore-cli",
+    "agentcore:project-name": "travelAgentStrands",
+    "app": "edd-travel-agent-strands",
+    "project": "edd-workshop",
+    "env": "workshop"
+  },
+  "runtimes": [
+    {
+      "name": "travelAgent",
+      "build": "CodeZip",
+      "entrypoint": "runtime/main.py",
+      "codeLocation": ".",
+      "runtimeVersion": "PYTHON_3_12",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "idleTimeout": 900,
+      "maxLifetime": 3600,
+      "environmentVariables": {
+        "AWS_REGION": "us-east-1",
+        "MODEL_ID": "us.anthropic.claude-sonnet-4-6",
+        "UNIFIED_TRACES_DESTINATION_ENABLED": "false"
+      }
+    }
+  ],
+  "memories": [],
+  "credentials": [],
+  "evaluators": [],
+  "onlineEvalConfigs": [],
+  "agentCoreGateways": [],
+  "policyEngines": [],
+  "configBundles": [],
+  "abTests": [],
+  "httpGateways": []
+}

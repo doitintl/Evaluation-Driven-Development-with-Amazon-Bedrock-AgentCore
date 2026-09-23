@@ -1,0 +1,362 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AgentCore Observability infrastructure (participant-deployed, Module 1).
+  Creates Transaction Search wiring, agent CloudWatch Log Group, and
+  log group index policy. Does NOT create any evaluation resources —
+  those are deployed separately in Module 2.
+
+Parameters:
+  ServiceName:
+    Type: String
+    Default: travel-agent-edd-workshop
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_\-\.]{0,127}$'
+    Description: >
+      OTEL service.name the agent emits. Becomes the log group suffix:
+      /aws/bedrock-agentcore/runtimes/<ServiceName>
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # 1) CloudWatch Transaction Search wiring (account-level, idempotent)
+  # ------------------------------------------------------------------
+  # Flips X-Ray trace destination from legacy "XRay" backend to
+  # "CloudWatchLogs" so OTLP traces land in aws/spans.
+
+  TxnSearchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: txnsearch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:UpdateTraceSegmentDestination
+                  - xray:GetTraceSegmentDestination
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              # UpdateTraceSegmentDestination REQUIRES a CloudWatch Logs resource
+              # policy that lets xray.amazonaws.com write to aws/spans — without
+              # it the call fails with "XRay does not have permission to call
+              # PutLogEvents on the aws/spans Log Group" (verified live
+              # 2026-07-28 on a fresh sandbox). The Lambda creates that policy
+              # first, so it needs PutResourcePolicy. These are account-level
+              # calls with no resource ARN; region-scoped via Condition.
+              - Effect: Allow
+                Action:
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              # UpdateTraceSegmentDestination also sets a retention policy on
+              # aws/spans on the CALLER's behalf. Without this the FIRST attempt
+              # fails with "not authorized to perform: logs:PutRetentionPolicy
+              # on resource: ...log-group:aws/spans:log-stream:*" (observed live
+              # 2026-08-03, account 853958187367). The handler's retry loop then
+              # succeeds ~31s later, so the stack still reaches CREATE_COMPLETE
+              # and the gap is invisible in the stack status: it shows up only in
+              # the Lambda log. During that window X-Ray rejects OTLP with a 400,
+              # so any span emitted then is lost for good. Scoped to aws/spans.
+              - Effect: Allow
+                Action:
+                  - logs:PutRetentionPolicy
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:aws/spans:*
+              # Enabling Transaction Search makes X-Ray call Application
+              # Signals' StartDiscovery on the CALLER's behalf, and that
+              # discovery in turn creates a CloudTrail service-linked channel.
+              # All three permissions below are required; each was found by a
+              # clean-account deploy failing on the next one in sequence
+              # (verified live 2026-07-28, accounts 080502724788 then
+              # 060241295609):
+              #   1. application-signals:StartDiscovery — else 403 "not
+              #      authorized to perform: application-signals:StartDiscovery"
+              #   2. cloudtrail:CreateServiceLinkedChannel — else 403 "Access
+              #      denied to perform: cloudtrail:CreateServiceLinkedChannel
+              #      (Service: ApplicationSignals)"
+              #   3. iam:CreateServiceLinkedRole — for the SLRs those create
+              # NOTE: an account that ALREADY has Transaction Search enabled
+              # hides all of these, because the handler short-circuits on
+              # AlreadySet. Only a truly clean account exercises this path.
+              - Effect: Allow
+                Action:
+                  - application-signals:StartDiscovery
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              # CreateServiceLinkedChannel is an account-level CloudTrail
+              # operation with no resource ARN; region-scoped instead.
+              - Effect: Allow
+                Action:
+                  - cloudtrail:CreateServiceLinkedChannel
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/application-signals.cloudwatch.amazonaws.com/AWSServiceRoleForCloudWatchApplicationSignals
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/cloudtrail.amazonaws.com/*
+
+  TxnSearchFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-txn-search'
+      Runtime: python3.12
+      Handler: index.handler
+      # 900s (Lambda max). With the correct IAM permissions the whole thing
+      # takes <10s (verified live 2026-07-28 from a clean account: 8.6s, zero
+      # retries). The long ceiling exists so the PENDING-wait and retry loops
+      # can never outlive the function: a Lambda timeout here means CFN waits
+      # ~1h for a cfn-response that never comes.
+      Timeout: 900
+      Role: !GetAtt TxnSearchRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, time, json, urllib.request
+          # Inline cfnresponse shim — the `cfnresponse` module is NOT auto-injected
+          # on python3.10+ inline Lambdas, so we implement send() with urllib to
+          # stay runtime-independent.
+          class cfnresponse:
+            SUCCESS = 'SUCCESS'
+            FAILED = 'FAILED'
+            @staticmethod
+            def send(event, context, status, data, physical_id=None):
+              body = json.dumps({
+                'Status': status,
+                'Reason': 'See CloudWatch Log Stream: ' + context.log_stream_name,
+                'PhysicalResourceId': physical_id or context.log_stream_name,
+                'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'], 'Data': data,
+              }).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+          def handler(event, context):
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            client = boto3.client('xray')
+            logs = boto3.client('logs')
+            # Wait out any in-flight destination change: while status is
+            # PENDING, UpdateTraceSegmentDestination is rejected with
+            # InvalidRequestException ("Updates are not allowed while the
+            # current status is PENDING") — verified live 2026-07-28.
+            already_set = False
+            for _ in range(20):
+              try:
+                resp = client.get_trace_segment_destination()
+              except Exception:
+                break
+              if resp.get('Status') == 'PENDING':
+                print('destination status PENDING, waiting...')
+                time.sleep(15)
+                continue
+              already_set = resp.get('Destination') == 'CloudWatchLogs'
+              break
+            if already_set:
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'AlreadySet'})
+              return
+            # Pre-req: X-Ray must be allowed to deliver spans into aws/spans.
+            # Without this resource policy, UpdateTraceSegmentDestination fails
+            # with AccessDeniedException ("XRay does not have permission to call
+            # PutLogEvents on the aws/spans Log Group").
+            try:
+              sts = boto3.client('sts')
+              acct = sts.get_caller_identity()['Account']
+              region = context.invoked_function_arn.split(':')[3]
+              logs.put_resource_policy(
+                policyName='XRayTransactionSearchAccess',
+                policyDocument=json.dumps({
+                  'Version': '2012-10-17',
+                  'Statement': [{
+                    'Effect': 'Allow',
+                    'Principal': {'Service': 'xray.amazonaws.com'},
+                    'Action': 'logs:PutLogEvents',
+                    'Resource': [
+                      f'arn:aws:logs:{region}:{acct}:log-group:aws/spans:*',
+                      f'arn:aws:logs:{region}:{acct}:log-group:/aws/application-signals/data:*',
+                    ],
+                    'Condition': {
+                      'ArnLike': {'aws:SourceArn': f'arn:aws:xray:{region}:{acct}:*'},
+                      'StringEquals': {'aws:SourceAccount': acct},
+                    },
+                  }],
+                }),
+              )
+            except Exception as e:
+              print('put_resource_policy FAILED: %s' % e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': 'put_resource_policy: %s' % e})
+              return
+            # Retry with backoff: the aws/spans resource policy and the
+            # Application Signals service-linked role both need a moment to
+            # become visible to X-Ray's authorizer on a fresh account.
+            # ~6 minute window, well under the 900s function timeout so the
+            # cfn-response is always sent.
+            last_err = None
+            for attempt in range(12):
+              try:
+                client.update_trace_segment_destination(Destination='CloudWatchLogs')
+                time.sleep(5)
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'Updated'})
+                return
+              except Exception as e:
+                last_err = e
+                print('update_trace_segment_destination attempt %d failed: %s' % (attempt + 1, e))
+                time.sleep(30)
+            cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(last_err)})
+
+  TxnSearchEnable:
+    Type: Custom::TxnSearch
+    Properties:
+      ServiceToken: !GetAtt TxnSearchFn.Arn
+      Version: '1'
+
+  # ------------------------------------------------------------------
+  # 2) Agent CloudWatch Log Group + index policy
+  # ------------------------------------------------------------------
+  # NOTE: We do NOT declare an AWS::Logs::LogGroup resource here. For the
+  # AgentCore Runtime variant (1a), Runtime auto-creates the log group on
+  # first invocation, so a declarative LogGroup collides (EarlyValidation
+  # ResourceExistenceCheck failure). Instead the IndexPolicyFn below creates
+  # the log group if it does not already exist — idempotent across all
+  # Module 1 variants (Runtime-created OR EC2-created).
+
+  IndexPolicyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: indexpolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # PutIndexPolicy requires "*" — it is a log-group-level call whose
+              # pre-flight validation fails against narrowly-scoped ARNs. The IAM
+              # service-authorization reference for `logs` confirms PutIndexPolicy /
+              # DeleteIndexPolicy / DescribeIndexPolicies operate at the account
+              # level (the log group is named inside the API call, not via an IAM
+              # ARN). CreateLogGroup / DescribeLogGroups here are the idempotent
+              # ensure-exists path for EC2 variants. The aws:RequestedRegion
+              # Condition is the most restrictive scoping available and matches the
+              # sibling AccountLevelLogsIndexPolicyNoResourceArnAvailable statement
+              # in agentcore-eval-and-obs.yaml (Checkov CKV_AWS_111 constraint).
+              - Sid: AccountLevelLogsIndexAndGroupNoResourceArnAvailable
+                Effect: Allow
+                Action:
+                  - logs:PutIndexPolicy
+                  - logs:DescribeIndexPolicies
+                  - logs:DeleteIndexPolicy
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogGroups
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion:
+                      - !Ref AWS::Region
+
+  IndexPolicyFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-index-policy'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt IndexPolicyRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request
+          # Inline cfnresponse shim (see note in TxnSearchFn) — required on py3.10+.
+          class cfnresponse:
+            SUCCESS = 'SUCCESS'
+            FAILED = 'FAILED'
+            @staticmethod
+            def send(event, context, status, data, physical_id=None):
+              body = json.dumps({
+                'Status': status,
+                'Reason': 'See CloudWatch Log Stream: ' + context.log_stream_name,
+                'PhysicalResourceId': physical_id or context.log_stream_name,
+                'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                'LogicalResourceId': event['LogicalResourceId'], 'Data': data,
+              }).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+          def handler(event, context):
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            client = boto3.client('logs')
+            log_group = event['ResourceProperties']['LogGroupName']
+            # Ensure the log group exists (Runtime may have already created it;
+            # for EC2 variants it may not exist yet). Idempotent.
+            if not log_group.startswith('aws/spans'):
+              try:
+                client.create_log_group(logGroupName=log_group)
+              except client.exceptions.ResourceAlreadyExistsException:
+                pass
+              except Exception:
+                pass
+            policy = {
+              "Fields": ["resource.attributes.service.name", "attributes.session.id"]
+            }
+            try:
+              client.put_index_policy(
+                logGroupIdentifier=log_group,
+                policyDocument=json.dumps(policy)
+              )
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'Created'})
+            except Exception as e:
+              if 'already exists' in str(e).lower():
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'AlreadyExists'})
+              else:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  AgentLogGroupIndexPolicy:
+    Type: Custom::IndexPolicy
+    Properties:
+      ServiceToken: !GetAtt IndexPolicyFn.Arn
+      LogGroupName: !Sub '/aws/bedrock-agentcore/runtimes/${ServiceName}'
+      Version: '2'
+
+  SpansLogGroupIndexPolicy:
+    Type: Custom::IndexPolicy
+    DependsOn: TxnSearchEnable
+    Properties:
+      ServiceToken: !GetAtt IndexPolicyFn.Arn
+      LogGroupName: 'aws/spans'
+      Version: '2'
+
+Outputs:
+  AgentLogGroupName:
+    Value: !Sub '/aws/bedrock-agentcore/runtimes/${ServiceName}'
+    Description: The CloudWatch log group where the agent's invoke_agent log events land.
+  ServiceName:
+    Value: !Ref ServiceName
+    Description: The OTEL service.name used for this deployment.
+  TransactionSearchStatus:
+    Value: !GetAtt TxnSearchEnable.Status
+    Description: Whether Transaction Search was enabled or was already active.
